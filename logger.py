@@ -1,0 +1,216 @@
+"""
+Session debug logging for Telegram bot.
+
+Logs Claude Agent SDK events and Telegram messages for debugging.
+"""
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+# Logs directory
+LOGS_DIR = Path(__file__).parent / "logs"
+
+# Content preview length
+PREVIEW_LENGTH = 60
+
+
+def _preview(text: str, length: int = PREVIEW_LENGTH) -> str:
+    """Truncate text to preview length with ellipsis."""
+    if not text:
+        return ""
+    # Replace newlines with spaces for single-line preview
+    text = text.replace('\n', ' ').replace('\r', '')
+    if len(text) <= length:
+        return text
+    return text[:length] + "..."
+
+
+def _timestamp() -> float:
+    """Get current Unix timestamp with milliseconds."""
+    return time.time()
+
+
+def _format_time(ts: float) -> str:
+    """Format timestamp for human-readable log."""
+    dt = datetime.fromtimestamp(ts)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{int((ts % 1) * 1000):03d}"
+
+
+class SessionLogger:
+    """Logger for a single Claude session.
+
+    Creates a session directory with:
+    - session.log: Human-readable timeline
+    - session.jsonl: Machine-readable JSON lines
+    """
+
+    def __init__(self, thread_id: int, chat_id: int, cwd: str):
+        self.thread_id = thread_id
+        self.chat_id = chat_id
+        self.cwd = cwd
+
+        # Create session directory
+        self.session_dir = self._create_session_dir()
+
+        # Open log files
+        self.jsonl_path = self.session_dir / "session.jsonl"
+        self.log_path = self.session_dir / "session.log"
+        self.jsonl_file = open(self.jsonl_path, "a", encoding="utf-8")
+        self.log_file = open(self.log_path, "a", encoding="utf-8")
+
+        # Log session start
+        self.log_session_start()
+
+    def _create_session_dir(self) -> Path:
+        """Create session directory with timestamp."""
+        LOGS_DIR.mkdir(exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_dir = LOGS_DIR / f"session_{self.thread_id}_{ts}"
+        session_dir.mkdir(exist_ok=True)
+
+        return session_dir
+
+    def _write_jsonl(self, entry: dict) -> None:
+        """Write a JSON line entry."""
+        entry["ts"] = _timestamp()
+        self.jsonl_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self.jsonl_file.flush()
+
+    def _write_log(self, message: str) -> None:
+        """Write a human-readable log line."""
+        ts = _format_time(_timestamp())
+        self.log_file.write(f"[{ts}] {message}\n")
+        self.log_file.flush()
+
+    def log_session_start(self) -> None:
+        """Log session start."""
+        self._write_jsonl({
+            "type": "session_start",
+            "thread_id": self.thread_id,
+            "chat_id": self.chat_id,
+            "cwd": self.cwd
+        })
+        self._write_log(f"SESSION START thread={self.thread_id} chat={self.chat_id} cwd={self.cwd}")
+
+    def log_session_end(self, reason: str) -> None:
+        """Log session end."""
+        self._write_jsonl({
+            "type": "session_end",
+            "reason": reason
+        })
+        self._write_log(f"SESSION END ({reason})")
+
+    def log_user_input(self, text: str) -> None:
+        """Log user input from Telegram."""
+        self._write_jsonl({
+            "type": "user_input",
+            "content": text
+        })
+        self._write_log(f"USER INPUT \"{_preview(text)}\"")
+
+    def log_sdk_message(self, message: Any) -> None:
+        """Log any Agent SDK message."""
+        msg_type = type(message).__name__
+
+        # Extract content preview based on message type
+        content_preview = ""
+        try:
+            if hasattr(message, 'content'):
+                if isinstance(message.content, str):
+                    content_preview = _preview(message.content)
+                elif isinstance(message.content, list):
+                    # Handle content blocks
+                    for block in message.content[:2]:  # First 2 blocks
+                        if hasattr(block, 'text'):
+                            content_preview = _preview(block.text)
+                            break
+                        elif hasattr(block, 'name'):
+                            content_preview = f"{block.name}(...)"
+                            break
+            elif hasattr(message, 'result'):
+                content_preview = _preview(str(message.result or ""))
+        except Exception:
+            pass
+
+        self._write_jsonl({
+            "type": "sdk_message",
+            "msg_type": msg_type,
+            "content_preview": content_preview
+        })
+        self._write_log(f"SDK {msg_type} \"{content_preview}\"")
+
+    def log_tool_call(self, name: str, input_data: dict) -> None:
+        """Log tool invocation."""
+        # Truncate input for logging
+        input_preview = {}
+        for k, v in input_data.items():
+            v_str = str(v)
+            input_preview[k] = v_str[:100] + "..." if len(v_str) > 100 else v_str
+
+        self._write_jsonl({
+            "type": "tool_call",
+            "tool": name,
+            "input": input_preview
+        })
+        self._write_log(f"TOOL CALL {name}({json.dumps(input_preview)})")
+
+    def log_tool_result(self, name: str, output: str, success: bool = True) -> None:
+        """Log tool result."""
+        self._write_jsonl({
+            "type": "tool_result",
+            "tool": name,
+            "output_preview": _preview(output, 200),
+            "success": success
+        })
+        status = "OK" if success else "FAIL"
+        self._write_log(f"TOOL RESULT {name} [{status}] \"{_preview(output)}\"")
+
+    def log_session_stats(self, cost: float, duration_ms: int, tokens: dict) -> None:
+        """Log final session stats."""
+        self._write_jsonl({
+            "type": "session_stats",
+            "cost_usd": cost,
+            "duration_ms": duration_ms,
+            "tokens": tokens
+        })
+        self._write_log(f"STATS cost=${cost:.4f} duration={duration_ms}ms tokens={tokens}")
+
+    def log_telegram_send(self, content: str, message_id: int) -> None:
+        """Log a Telegram message send."""
+        self._write_jsonl({
+            "type": "telegram_send",
+            "message_id": message_id,
+            "content_preview": _preview(content)
+        })
+        self._write_log(f"TELEGRAM SEND msg={message_id} \"{_preview(content)}\"")
+
+    def log_telegram_edit(self, message_id: int, old_content: str, new_content: str) -> None:
+        """Log a Telegram message edit."""
+        self._write_jsonl({
+            "type": "telegram_edit",
+            "message_id": message_id,
+            "old_preview": _preview(old_content),
+            "new_preview": _preview(new_content)
+        })
+        self._write_log(f"TELEGRAM EDIT msg={message_id} \"{_preview(old_content)}\" -> \"{_preview(new_content)}\"")
+
+    def log_error(self, context: str, error: Exception) -> None:
+        """Log an error."""
+        self._write_jsonl({
+            "type": "error",
+            "context": context,
+            "error": str(error),
+            "error_type": type(error).__name__
+        })
+        self._write_log(f"ERROR [{context}] {type(error).__name__}: {error}")
+
+    def close(self) -> None:
+        """Close log files."""
+        try:
+            self.jsonl_file.close()
+            self.log_file.close()
+        except Exception:
+            pass
