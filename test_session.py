@@ -31,24 +31,29 @@ class TestCalculateContextRemaining:
         assert calculate_context_remaining(usage) is None
 
     def test_normal_usage_calculates_correctly(self):
-        """Normal usage should calculate correct percentage remaining."""
-        # 20000 tokens out of 200000 = 10% used = 90% remaining
+        """Normal usage should calculate correct percentage remaining.
+
+        Note: Only input_tokens + output_tokens are counted.
+        Cache tokens are excluded due to inflated values from server-side tools.
+        """
+        # 7000 tokens (5000 input + 2000 output) out of 200000 = 3.5% used = 96.5% remaining
         usage = {
             "input_tokens": 5000,
-            "cache_read_input_tokens": 10000,
-            "cache_creation_input_tokens": 3000,
+            "cache_read_input_tokens": 10000,  # ignored
+            "cache_creation_input_tokens": 3000,  # ignored
             "output_tokens": 2000,
         }
         result = calculate_context_remaining(usage)
-        assert result == 90.0
+        assert result == 96.5
 
     def test_half_context_used(self):
         """50% context used should return 50% remaining."""
+        # Only input_tokens + output_tokens counted
         usage = {
             "input_tokens": 50000,
-            "cache_read_input_tokens": 50000,
+            "cache_read_input_tokens": 50000,  # ignored
             "cache_creation_input_tokens": 0,
-            "output_tokens": 0,
+            "output_tokens": 50000,
         }
         result = calculate_context_remaining(usage)
         assert result == 50.0
