@@ -15,6 +15,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional, Any, Union
 
+import mistune
 from telegram import Bot, Message, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 
@@ -651,6 +652,7 @@ async def send_or_edit_response(
     """Send a new response message or edit an existing one.
 
     Handles overflow by starting a new message when text exceeds 4000 chars.
+    Includes robust fallback logic for HTML parsing errors.
 
     Args:
         session: The Claude session
@@ -665,56 +667,126 @@ async def send_or_edit_response(
     if not text.strip():
         return existing_msg, msg_text_len
 
+    # Truncate if too long (safety net)
+    display_text = text
+    if len(display_text) > 4000:
+        display_text = display_text[:3990] + "\n..."
+
     # Check if we need to overflow to a new message
     if len(text) > 4000 and existing_msg and msg_text_len > 0:
         # Current message is full, start a new one with overflow text
         overflow_text = text[msg_text_len:]
-        new_msg = await send_message(session, bot, markdown_to_html(overflow_text), parse_mode="HTML")
+        if len(overflow_text) > 4000:
+            overflow_text = overflow_text[:3990] + "\n..."
+        new_msg = await _send_with_fallback(session, bot, overflow_text, existing_msg=None)
         return new_msg, len(overflow_text) if new_msg else msg_text_len
 
-    # Convert markdown to HTML for Telegram
+    result_msg = await _send_with_fallback(session, bot, display_text, existing_msg=existing_msg)
+    if result_msg:
+        return result_msg, len(display_text)
+    return existing_msg, msg_text_len
+
+
+async def _send_with_fallback(
+    session: ClaudeSession,
+    bot: Bot,
+    text: str,
+    existing_msg: Optional[Message] = None,
+    max_retries: int = 3
+) -> Optional[Message]:
+    """Send or edit a message with multiple fallback strategies.
+
+    Fallback order:
+    1. Try HTML formatted message
+    2. If HTML fails, try plain text (stripped of HTML tags)
+    3. If still failing (e.g., flood control), retry with exponential backoff
+
+    Args:
+        session: The Claude session
+        bot: Telegram bot instance
+        text: Text to send (markdown format)
+        existing_msg: Existing message to edit, or None to send new
+        max_retries: Maximum retry attempts for transient errors
+
+    Returns:
+        Message object if successful, None otherwise
+    """
+    # Strategy 1: Try with HTML formatting
     html_text = markdown_to_html(text)
 
-    # Truncate HTML if still too long (safety net)
-    display_text = text
-    if len(display_text) > 4000:
-        display_text = display_text[:3990] + "\n..."
-        html_text = markdown_to_html(display_text)
+    for attempt in range(max_retries):
+        try:
+            if existing_msg:
+                await bot.edit_message_text(
+                    chat_id=session.chat_id,
+                    message_id=existing_msg.message_id,
+                    text=html_text,
+                    parse_mode="HTML"
+                )
+                return existing_msg
+            else:
+                return await bot.send_message(
+                    chat_id=session.chat_id,
+                    message_thread_id=session.thread_id,
+                    text=html_text,
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            error_str = str(e).lower()
 
-    try:
-        if existing_msg:
-            # Edit existing message
-            await bot.edit_message_text(
-                chat_id=session.chat_id,
-                message_id=existing_msg.message_id,
-                text=html_text,
-                parse_mode="HTML"
-            )
-            return existing_msg, len(display_text)
-        else:
-            # Send new message with rate limiting
-            new_msg = await send_message(session, bot, html_text, parse_mode="HTML")
-            return new_msg, len(display_text) if new_msg else 0
-    except Exception as e:
-        if session.logger and "message is not modified" not in str(e).lower():
-            session.logger.log_error("send_or_edit_response", e)
-        # Fallback to plain text if HTML fails
-        if "parse entities" in str(e).lower():
-            try:
-                if existing_msg:
-                    await bot.edit_message_text(
-                        chat_id=session.chat_id,
-                        message_id=existing_msg.message_id,
-                        text=display_text
-                    )
-                    return existing_msg, len(display_text)
-                else:
-                    new_msg = await send_message(session, bot, display_text)
-                    return new_msg, len(display_text) if new_msg else 0
-            except Exception as fallback_err:
-                if session.logger:
-                    session.logger.log_error("send_or_edit_response_fallback", fallback_err)
-        return existing_msg, msg_text_len
+            # Skip logging for "message not modified" - not an error
+            if "message is not modified" in error_str:
+                return existing_msg
+
+            if session.logger:
+                session.logger.log_error("send_with_fallback_html", e)
+
+            # Strategy 2: If HTML parsing failed, try plain text
+            if "parse entities" in error_str or "can't parse" in error_str:
+                plain_text = strip_html_tags(html_text)
+                try:
+                    if existing_msg:
+                        await bot.edit_message_text(
+                            chat_id=session.chat_id,
+                            message_id=existing_msg.message_id,
+                            text=plain_text
+                        )
+                        return existing_msg
+                    else:
+                        return await bot.send_message(
+                            chat_id=session.chat_id,
+                            message_thread_id=session.thread_id,
+                            text=plain_text
+                        )
+                except Exception as plain_err:
+                    if session.logger:
+                        session.logger.log_error("send_with_fallback_plain", plain_err)
+                    error_str = str(plain_err).lower()
+
+            # Strategy 3: Retry with backoff for transient errors
+            if "flood control" in error_str or "retry" in error_str or "timed out" in error_str:
+                # Extract retry time if available, otherwise use exponential backoff
+                wait_time = 2 ** attempt  # 1, 2, 4 seconds
+                if "retry in" in error_str:
+                    try:
+                        # Try to extract the retry time from error message
+                        import re
+                        match = re.search(r'retry in (\d+)', error_str)
+                        if match:
+                            wait_time = min(int(match.group(1)), 30)  # Cap at 30 seconds
+                    except Exception:
+                        pass
+
+                if attempt < max_retries - 1:
+                    if session.logger:
+                        session.logger.log_debug("send_with_fallback", f"Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                    continue
+
+            # Non-retryable error or max retries exceeded
+            break
+
+    return None
 
 
 async def send_message(
@@ -820,35 +892,145 @@ def escape_html(text: str) -> str:
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
+def strip_html_tags(text: str) -> str:
+    """Remove all HTML tags from text, leaving only content."""
+    return re.sub(r'<[^>]+>', '', text)
+
+
+class TelegramHTMLRenderer(mistune.HTMLRenderer):
+    """Custom mistune renderer that outputs Telegram-compatible HTML.
+
+    Telegram only supports a subset of HTML tags:
+    <b>, <strong>, <i>, <em>, <u>, <ins>, <s>, <strike>, <del>,
+    <span class="tg-spoiler">, <a href="">, <code>, <pre>
+    """
+
+    def text(self, text: str) -> str:
+        """Escape HTML entities in plain text."""
+        return escape_html(text)
+
+    def emphasis(self, text: str) -> str:
+        """Render *italic* text."""
+        return f'<i>{text}</i>'
+
+    def strong(self, text: str) -> str:
+        """Render **bold** text."""
+        return f'<b>{text}</b>'
+
+    def codespan(self, text: str) -> str:
+        """Render `inline code`."""
+        return f'<code>{escape_html(text)}</code>'
+
+    def block_code(self, code: str, info: Optional[str] = None) -> str:
+        """Render ```code blocks```."""
+        return f'<pre>{escape_html(code)}</pre>\n'
+
+    def link(self, text: str, url: str, title: Optional[str] = None) -> str:
+        """Render [text](url) links."""
+        return f'<a href="{escape_html(url)}">{text}</a>'
+
+    def strikethrough(self, text: str) -> str:
+        """Render ~~strikethrough~~ text."""
+        return f'<s>{text}</s>'
+
+    def heading(self, text: str, level: int, **attrs: Any) -> str:
+        """Render headings as bold text (Telegram doesn't support h1-h6)."""
+        prefix = '#' * level
+        return f'<b>{prefix} {text}</b>\n'
+
+    def paragraph(self, text: str) -> str:
+        """Render paragraphs with newlines."""
+        return f'{text}\n\n'
+
+    def linebreak(self) -> str:
+        """Render line breaks."""
+        return '\n'
+
+    def softbreak(self) -> str:
+        """Render soft breaks (single newlines in source)."""
+        return '\n'
+
+    def blank_line(self) -> str:
+        """Render blank lines."""
+        return '\n'
+
+    def thematic_break(self) -> str:
+        """Render horizontal rules as dashes."""
+        return '\n---\n'
+
+    def block_quote(self, text: str) -> str:
+        """Render blockquotes with > prefix."""
+        # Add > prefix to each line
+        lines = text.strip().split('\n')
+        quoted = '\n'.join(f'> {line}' for line in lines)
+        return f'{quoted}\n\n'
+
+    def list(self, text: str, ordered: bool, **attrs: Any) -> str:
+        """Render lists."""
+        return f'{text}\n'
+
+    def list_item(self, text: str) -> str:
+        """Render list items."""
+        return f'• {text.strip()}\n'
+
+    def image(self, text: str, url: str, title: Optional[str] = None) -> str:
+        """Render images as links (Telegram doesn't support inline images in text)."""
+        return f'[{text}]({escape_html(url)})'
+
+    # Table rendering - Telegram doesn't support HTML tables, so render as plain text
+    def table(self, text: str) -> str:
+        """Render table as plain text."""
+        return f'{text}\n'
+
+    def table_head(self, text: str) -> str:
+        """Render table header."""
+        return f'{text}'
+
+    def table_body(self, text: str) -> str:
+        """Render table body."""
+        return text
+
+    def table_row(self, text: str) -> str:
+        """Render table row as pipe-separated values."""
+        return f'{text}|\n'
+
+    def table_cell(self, text: str, align: Optional[str] = None, head: bool = False) -> str:
+        """Render table cell."""
+        if head:
+            return f'| <b>{text}</b> '
+        return f'| {text} '
+
+
+# Create a global markdown parser instance with the Telegram renderer
+# Enable strikethrough plugin for ~~text~~ support
+_telegram_md = mistune.create_markdown(
+    renderer=TelegramHTMLRenderer(),
+    plugins=['strikethrough', 'table']
+)
+
+
 def markdown_to_html(text: str) -> str:
-    """Convert common markdown patterns to Telegram HTML."""
-    # Escape HTML entities first
-    text = escape_html(text)
+    """Convert markdown to Telegram-compatible HTML using mistune.
 
-    # Code blocks (``` ... ```) - must be done before other patterns
-    text = re.sub(r'```(\w*)\n?(.*?)```', r'<pre>\2</pre>', text, flags=re.DOTALL)
-
-    # Inline code (`code`) - before bold/italic to protect code content
-    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
-
-    # Headers (# ## ### etc.) - make bold, keep the # symbols
-    text = re.sub(r'^(#{1,6})\s+(.+)$', r'<b>\1 \2</b>', text, flags=re.MULTILINE)
-
-    # Bold (**text** or __text__) - use DOTALL for multiline
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
-    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text, flags=re.DOTALL)
-
-    # Italic (*text* or _text_) - be careful not to match ** or __
-    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
-    text = re.sub(r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', r'<i>\1</i>', text)
-
-    # Strikethrough (~~text~~)
-    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text, flags=re.DOTALL)
-
-    # Links [text](url)
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
-
-    return text
+    This properly handles all markdown edge cases including:
+    - Nested formatting
+    - Tables with special characters
+    - Code blocks containing markdown-like syntax
+    - Complex inline code
+    """
+    try:
+        result = _telegram_md(text)
+        # mistune can return str or tuple, ensure we have str
+        if isinstance(result, tuple):
+            result = result[0]
+        # Type assertion for mypy - at this point result is always str
+        result_str: str = str(result) if not isinstance(result, str) else result
+        # Clean up excessive newlines
+        result_str = re.sub(r'\n{3,}', '\n\n', result_str)
+        return result_str.strip()
+    except Exception:
+        # If parsing fails, return escaped plain text
+        return escape_html(text)
 
 
 def format_tool_call(name: str, input_dict: dict) -> str:

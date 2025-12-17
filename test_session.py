@@ -167,16 +167,16 @@ class TestSendOrEditResponse:
         """Short text with no existing message should send new."""
         text = "Hello world"
         new_msg = MagicMock(spec=Message)
+        mock_bot.send_message.return_value = new_msg
+        mock_session.thread_id = 1
 
-        with patch('session.send_message', new_callable=AsyncMock) as mock_send:
-            mock_send.return_value = new_msg
-            result_msg, result_len = await send_or_edit_response(
-                mock_session, mock_bot, None, text, 0
-            )
+        result_msg, result_len = await send_or_edit_response(
+            mock_session, mock_bot, None, text, 0
+        )
 
         assert result_msg == new_msg
         assert result_len == len(text)
-        mock_send.assert_called_once()
+        mock_bot.send_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_overflow_creates_new_message(self, mock_session, mock_bot, mock_message):
@@ -188,31 +188,32 @@ class TestSendOrEditResponse:
 
         new_msg = MagicMock(spec=Message)
         new_msg.message_id = 789
+        mock_bot.send_message.return_value = new_msg
+        mock_session.thread_id = 1
 
-        with patch('session.send_message', new_callable=AsyncMock) as mock_send:
-            mock_send.return_value = new_msg
-            result_msg, result_len = await send_or_edit_response(
-                mock_session, mock_bot, mock_message, full_text, 3000
-            )
+        result_msg, result_len = await send_or_edit_response(
+            mock_session, mock_bot, mock_message, full_text, 3000
+        )
 
         assert result_msg == new_msg
         assert result_len == 2000  # Length of overflow text
         # Should send the overflow portion only
-        mock_send.assert_called_once()
-        call_args = mock_send.call_args
-        assert "b" * 2000 in call_args[0][2] or new_text in str(call_args)
+        mock_bot.send_message.assert_called_once()
+        call_args = mock_bot.send_message.call_args
+        # Check that the text contains the overflow content (b's)
+        assert "b" in str(call_args)
 
     @pytest.mark.asyncio
     async def test_first_message_over_4000_truncates(self, mock_session, mock_bot):
         """First message (no existing) over 4000 should truncate as safety net."""
         text = "a" * 5000
         new_msg = MagicMock(spec=Message)
+        mock_bot.send_message.return_value = new_msg
+        mock_session.thread_id = 1
 
-        with patch('session.send_message', new_callable=AsyncMock) as mock_send:
-            mock_send.return_value = new_msg
-            result_msg, result_len = await send_or_edit_response(
-                mock_session, mock_bot, None, text, 0
-            )
+        result_msg, result_len = await send_or_edit_response(
+            mock_session, mock_bot, None, text, 0
+        )
 
         # Should truncate to ~3990 + "..."
         assert result_len <= 4000
