@@ -17,7 +17,7 @@ from typing import Optional, Any, Union
 from telegram import Bot, Message, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ProcessError, PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ProcessError, PermissionResultAllow, PermissionResultDeny, HookMatcher, HookContext
 
 from config import PROJECTS_DIR
 from logger import SessionLogger
@@ -249,6 +249,37 @@ def create_permission_handler(session: ClaudeSession):
     return handle_permission
 
 
+def create_pre_compact_hook(session: ClaudeSession):
+    """Create a PreCompact hook to log and notify user when context is being compacted."""
+    async def handle_pre_compact(
+        input_data: dict[str, Any],
+        tool_use_id: Optional[str],
+        context: HookContext
+    ) -> dict[str, Any]:
+        """Called before the SDK compacts conversation history."""
+        try:
+            # Log the compaction event with full input data for analysis
+            if session.logger:
+                session.logger.log_compact_event(input_data)
+
+            # Notify user in chat
+            if session.bot:
+                await session.bot.send_message(
+                    chat_id=session.chat_id,
+                    message_thread_id=session.thread_id,
+                    text="📦 <b>Context compacting...</b>\nConversation history is being summarized to free up space.",
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            if session.logger:
+                session.logger.log_error("pre_compact_hook", e)
+
+        # Return empty dict to allow compaction to proceed
+        return {}
+
+    return handle_pre_compact
+
+
 # Active sessions: thread_id -> ClaudeSession
 sessions: dict[int, ClaudeSession] = {}
 
@@ -263,15 +294,29 @@ def calculate_context_remaining(usage: dict, model: str = "default") -> Optional
     """Calculate percentage of context window remaining from usage data.
 
     Returns percentage remaining (0-100), or None if usage data insufficient.
+
+    Note: We intentionally exclude cache_read_input_tokens from the calculation.
+    The cache_read tokens appear to include accumulated reads from server-side
+    tools (like web_search, web_fetch) that don't represent actual conversation
+    context. The official docs confirm this issue:
+    https://platform.claude.com/docs/en/build-with-claude/context-editing#client-side-compaction-sdk
+
+    "When using server-side tools, the SDK may incorrectly calculate token usage...
+    the cache_read_input_tokens value includes accumulated reads from multiple
+    internal API calls made by the server-side tool, not your actual conversation
+    context."
+
+    We'll revisit this calculation when we observe an actual PreCompact event
+    and can correlate the token counts with real context exhaustion.
     """
     if not usage:
         return None
 
-    # Sum all token types that count toward context
+    # Only count non-cached tokens: input + output
+    # Exclude cache_read_input_tokens (seems to include shared system cache)
+    # Exclude cache_creation_input_tokens (represents what's being cached, not consumed)
     total_tokens = (
         usage.get("input_tokens", 0) +
-        usage.get("cache_read_input_tokens", 0) +
-        usage.get("cache_creation_input_tokens", 0) +
         usage.get("output_tokens", 0)
     )
 
@@ -407,7 +452,12 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             can_use_tool=create_permission_handler(session),
             permission_mode="acceptEdits",
             cwd=session.cwd,
-            resume=session.session_id  # Resume previous conversation if exists
+            resume=session.session_id,  # Resume previous conversation if exists
+            hooks={
+                "PreCompact": [
+                    HookMatcher(hooks=[create_pre_compact_hook(session)])
+                ]
+            }
         )
 
         # Query Claude using ClaudeSDKClient (required for can_use_tool support)

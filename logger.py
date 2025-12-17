@@ -267,6 +267,20 @@ class SessionLogger:
         })
         self._write_log(f"DEBUG [{context}] {message}")
 
+    def log_compact_event(self, input_data: dict) -> None:
+        """Log a PreCompact hook event.
+
+        This captures the full input_data for later analysis to understand
+        what token counts look like when compaction is actually triggered.
+        """
+        self._write_jsonl({
+            "type": "compact_event",
+            "input_data": input_data
+        })
+        # Log summary for human-readable log
+        summary = json.dumps(input_data)[:200] if input_data else "{}"
+        self._write_log(f"COMPACT EVENT {summary}")
+
     def close(self) -> None:
         """Close log files."""
         try:
