@@ -118,6 +118,7 @@ class ClaudeSession:
     session_id: Optional[str] = None  # For multi-turn conversation
     client: Optional[ClaudeSDKClient] = None  # Active SDK client for interrupt support
     last_context_percent: Optional[float] = None  # Last known context remaining %
+    pending_image_path: Optional[str] = None  # Buffered image waiting for prompt
 
 
 async def interrupt_session(thread_id: int) -> bool:
