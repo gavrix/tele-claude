@@ -3,12 +3,17 @@ Telegram bot handlers for Claude Code bridge.
 
 Handles commands, callbacks, and message forwarding to Claude sessions.
 """
+import logging
+from typing import Optional
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import ContextTypes
 
+logger = logging.getLogger(__name__)
+
 from config import GENERAL_TOPIC_ID
 from utils import get_project_folders
-from session import sessions, start_session, send_to_claude
+from session import sessions, start_session, send_to_claude, resolve_permission
 
 
 async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -62,6 +67,7 @@ async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             reply_markup=reply_markup
         )
     except Exception as e:
+        logger.error(f"Failed to create topic '{topic_name}': {e}", exc_info=True)
         await message.reply_text(f"Failed to create topic: {e}")
 
 
@@ -139,11 +145,69 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
             return
 
+    # Handle permission responses: "perm:<action>:<request_id>:<tool_name>"
+    if data.startswith("perm:"):
+        parts = data.split(":", 3)
+        if len(parts) == 4:
+            _, action, request_id, tool_name = parts
+
+            callback_message = query.message
+            if callback_message is None or not isinstance(callback_message, Message):
+                return
+
+            # Try to get logger from session for this thread
+            perm_thread_id: Optional[int] = callback_message.message_thread_id
+            session = sessions.get(perm_thread_id) if perm_thread_id else None
+            if session and session.logger:
+                session.logger.log_permission_callback(request_id, action, tool_name)
+                session.logger.log_debug("callback", f"Calling resolve_permission",
+                    request_id=request_id, action=action, sessions_keys=list(sessions.keys()))
+
+            if action == "allow":
+                success = await resolve_permission(request_id, allowed=True, always=False, tool_name=tool_name)
+                if session and session.logger:
+                    session.logger.log_debug("callback", f"resolve_permission returned {success}", request_id=request_id)
+                if success:
+                    await callback_message.edit_text(
+                        f"✅ Allowed <code>{tool_name}</code> (one-time)",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await callback_message.edit_text("⚠️ Permission request expired")
+
+            elif action == "deny":
+                success = await resolve_permission(request_id, allowed=False, always=False, tool_name=tool_name)
+                if session and session.logger:
+                    session.logger.log_debug("callback", f"resolve_permission (deny) returned {success}", request_id=request_id)
+                if success:
+                    await callback_message.edit_text(
+                        f"❌ Denied <code>{tool_name}</code>",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await callback_message.edit_text("⚠️ Permission request expired")
+
+            elif action == "always":
+                success = await resolve_permission(request_id, allowed=True, always=True, tool_name=tool_name)
+                if session and session.logger:
+                    session.logger.log_debug("callback", f"resolve_permission (always) returned {success}", request_id=request_id)
+                if success:
+                    await callback_message.edit_text(
+                        f"✅ Always allowed <code>{tool_name}</code>",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await callback_message.edit_text("⚠️ Permission request expired")
+
+            return
+
     # Unknown callback - ignore
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text messages and forward to Claude session if active."""
+    import asyncio
+
     message = update.message
     if message is None:
         return
@@ -155,7 +219,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Check if this thread has an active Claude session
     if thread_id and thread_id in sessions:
-        await send_to_claude(thread_id, text, context.bot)
+        # Run as background task - don't await!
+        # Awaiting would block callback processing (deadlock for permission buttons)
+        asyncio.create_task(send_to_claude(thread_id, text, context.bot))
         return
 
     # Ignore messages in General topic (no echo needed)
