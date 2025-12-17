@@ -3,6 +3,9 @@ Telegram bot handlers for Claude Code bridge.
 
 Handles commands, callbacks, and message forwarding to Claude sessions.
 """
+import asyncio
+import os
+import tempfile
 from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -206,10 +209,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Unknown callback - ignore
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle photo messages - save to temp dir and send to Claude."""
+    message = update.message
+    if message is None or not message.photo:
+        return
+
+    thread_id = message.message_thread_id
+    if not thread_id or thread_id not in sessions:
+        return
+
+    session = sessions[thread_id]
+
+    # Get largest photo (last in array)
+    photo = message.photo[-1]
+
+    # Download photo to system temp directory
+    file = await context.bot.get_file(photo.file_id)
+    photo_path = os.path.join(tempfile.gettempdir(), f"telegram_photo_{photo.file_unique_id}.jpg")
+    await file.download_to_drive(photo_path)
+
+    caption = message.caption
+    if caption:
+        # Image with caption - send immediately
+        prompt = f"{photo_path}\n\n{caption}"
+
+        # Interrupt any ongoing query first
+        was_interrupted = await interrupt_session(thread_id)
+        if was_interrupted:
+            await asyncio.sleep(0.1)
+
+        asyncio.create_task(send_to_claude(thread_id, prompt, context.bot))
+    else:
+        # Image without caption - buffer silently, wait for next text message
+        session.pending_image_path = photo_path
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text messages and forward to Claude session if active."""
-    import asyncio
-
     message = update.message
     if message is None:
         return
@@ -221,6 +258,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Check if this thread has an active Claude session
     if thread_id and thread_id in sessions:
+        session = sessions[thread_id]
+
+        # Check for pending image
+        pending_image = session.pending_image_path
+        if pending_image:
+            session.pending_image_path = None  # Clear it
+            prompt = f"{pending_image}\n\n{text}"
+        else:
+            prompt = text
+
         # Interrupt any ongoing query first
         was_interrupted = await interrupt_session(thread_id)
         if was_interrupted:
@@ -229,7 +276,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Run as background task - don't await!
         # Awaiting would block callback processing (deadlock for permission buttons)
-        asyncio.create_task(send_to_claude(thread_id, text, context.bot))
+        asyncio.create_task(send_to_claude(thread_id, prompt, context.bot))
         return
 
     # Ignore messages in General topic (no echo needed)

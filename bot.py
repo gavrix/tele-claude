@@ -4,7 +4,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 
 from config import BOT_TOKEN
-from handlers import handle_new_topic, handle_callback, handle_message, handle_topic_created
+from handlers import handle_new_topic, handle_callback, handle_message, handle_topic_created, handle_photo
 from logger import setup_logging
 
 # Configure logging - silent console, full file logging
@@ -37,6 +37,12 @@ def main() -> None:
     app.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.SUPERGROUP & ~filters.COMMAND,
         handle_message
+    ))
+
+    # Handle photo messages in groups
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.ChatType.SUPERGROUP,
+        handle_photo
     ))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
