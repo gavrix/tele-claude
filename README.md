@@ -10,6 +10,10 @@ A Telegram bot that connects forum topics to Claude Code CLI sessions.
 - Tool calls displayed with 🔧 indicator
 - Typing indicator shown during processing
 - Edit diffs rendered as syntax-highlighted images
+- Photo uploads supported for image analysis
+- Interactive tool permission prompts (approve/deny)
+- Context window warning when below 15%
+- Send a new message to interrupt Claude mid-response
 
 ## Setup
 
