@@ -1,8 +1,17 @@
+import logging
+
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 
 from config import BOT_TOKEN
 from handlers import handle_new_topic, handle_callback, handle_message, handle_topic_created
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:

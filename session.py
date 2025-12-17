@@ -12,18 +12,12 @@ import uuid
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, Union
 
 from telegram import Bot, Message, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 
-from claude_code_sdk import query, ClaudeCodeOptions
-from claude_code_sdk.types import (
-    ToolPermissionContext,
-    PermissionResult,
-    PermissionResultAllow,
-    PermissionResultDeny,
-)
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ProcessError, PermissionResultAllow, PermissionResultDeny
 
 from config import PROJECTS_DIR
 from logger import SessionLogger
@@ -31,13 +25,13 @@ from diff_image import edit_to_image
 
 
 # Tools that are always allowed without prompting
-DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"]
+DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task", "WebSearch"]
 
 # Persistent allowlist file
 ALLOWLIST_FILE = Path(__file__).parent / "tool_allowlist.json"
 
-# Pending permission requests: request_id -> asyncio.Future
-pending_permissions: dict[str, asyncio.Future] = {}
+# Pending permission requests: request_id -> (Future, SessionLogger)
+pending_permissions: dict[str, tuple[asyncio.Future, Optional["SessionLogger"]]] = {}
 
 
 def load_allowlist() -> set[str]:
@@ -74,11 +68,18 @@ def is_tool_allowed(tool_name: str) -> bool:
     return tool_name in load_allowlist()
 
 
-async def resolve_permission(request_id: str, allowed: bool, always: bool = False, tool_name: str = None) -> bool:
+async def resolve_permission(request_id: str, allowed: bool, always: bool = False, tool_name: Optional[str] = None) -> bool:
     """Resolve a pending permission request."""
-    future = pending_permissions.pop(request_id, None)
-    if future is None:
+    entry = pending_permissions.pop(request_id, None)
+    if entry is None:
+        # Log to stderr since we don't have a logger reference
+        print(f"[WARN] Permission future not found for request_id={request_id}, pending_keys={list(pending_permissions.keys())}")
         return False
+
+    future, logger = entry
+
+    if logger:
+        logger.log_permission_resolved(request_id, allowed, found=True)
 
     if always and tool_name:
         add_to_allowlist(tool_name)
@@ -109,6 +110,8 @@ async def request_tool_permission(
 ) -> bool:
     """Send permission request to Telegram and wait for user response."""
     if session.bot is None:
+        if session.logger:
+            session.logger.log_error("request_tool_permission", Exception("No bot reference available"))
         return False
 
     # Generate unique request ID
@@ -150,17 +153,29 @@ async def request_tool_permission(
         reply_markup=keyboard
     )
 
+    # Log the permission request
+    if session.logger:
+        session.logger.log_permission_request(request_id, tool_name, tool_input)
+
     # Create future and wait for response
-    loop = asyncio.get_event_loop()
+    # Use get_running_loop() - get_event_loop() is deprecated and may return wrong loop
+    loop = asyncio.get_running_loop()
     future = loop.create_future()
-    pending_permissions[request_id] = future
+    pending_permissions[request_id] = (future, session.logger)
+
+    if session.logger:
+        session.logger.log_debug("permission", f"Waiting for user response", request_id=request_id, pending_keys=list(pending_permissions.keys()))
 
     try:
         # Wait for user response (timeout after 5 minutes)
         allowed = await asyncio.wait_for(future, timeout=300.0)
+        if session.logger:
+            session.logger.log_debug("permission", f"Got user response: {allowed}", request_id=request_id)
         return allowed
     except asyncio.TimeoutError:
         pending_permissions.pop(request_id, None)
+        if session.logger:
+            session.logger.log_debug("permission", "Request timed out", request_id=request_id)
         await session.bot.send_message(
             chat_id=session.chat_id,
             message_thread_id=session.thread_id,
@@ -174,19 +189,36 @@ def create_permission_handler(session: ClaudeSession):
     async def handle_permission(
         tool_name: str,
         tool_input: dict,
-        context: ToolPermissionContext
-    ) -> PermissionResult:
-        # Check if tool is in allowlist
-        if is_tool_allowed(tool_name):
-            return PermissionResultAllow()
+        context: dict
+    ) -> Union[PermissionResultAllow, PermissionResultDeny]:
+        try:
+            in_allowlist = is_tool_allowed(tool_name)
 
-        # Request permission from user
-        allowed = await request_tool_permission(session, tool_name, tool_input)
+            if session.logger:
+                session.logger.log_permission_check(tool_name, in_allowlist)
 
-        if allowed:
-            return PermissionResultAllow()
-        else:
-            return PermissionResultDeny(message=f"User denied permission for {tool_name}")
+            # Check if tool is in allowlist
+            if in_allowlist:
+                if session.logger:
+                    session.logger.log_debug("permission_handler", f"Returning PermissionResultAllow (allowlist)")
+                return PermissionResultAllow(updated_input=tool_input)
+
+            # Request permission from user
+            allowed = await request_tool_permission(session, tool_name, tool_input)
+
+            if allowed:
+                if session.logger:
+                    session.logger.log_debug("permission_handler", f"Returning PermissionResultAllow (user allowed)")
+                return PermissionResultAllow(updated_input=tool_input)
+            else:
+                if session.logger:
+                    session.logger.log_debug("permission_handler", f"Returning PermissionResultDeny (user denied)")
+                return PermissionResultDeny(message=f"User denied permission for {tool_name}")
+        except Exception as e:
+            if session.logger:
+                session.logger.log_error("permission_handler", e)
+            # Return deny on error
+            return PermissionResultDeny(message=f"Permission error: {str(e)}")
 
     return handle_permission
 
@@ -278,7 +310,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             name, input_dict = tool_buffer[0]
             return format_tool_call(name, input_dict)
         else:
-            return format_tool_calls_batch(tool_buffer_name, tool_buffer)
+            return format_tool_calls_batch(tool_buffer_name or "Tool", tool_buffer)
 
     async def update_tool_buffer_message():
         """Send or edit the tool buffer message."""
@@ -294,8 +326,9 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                     text=text,
                     parse_mode="HTML"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                if session.logger and "message is not modified" not in str(e).lower():
+                    session.logger.log_error("update_tool_buffer_message", e)
         else:
             # Send new message
             tool_buffer_msg = await send_message(session, bot, text, parse_mode="HTML")
@@ -309,7 +342,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
 
     try:
         # Configure options - use permission handler for interactive tool approval
-        options = ClaudeCodeOptions(
+        options = ClaudeAgentOptions(
             allowed_tools=[],  # Empty - let can_use_tool handle all permissions
             can_use_tool=create_permission_handler(session),
             permission_mode="acceptEdits",
@@ -317,99 +350,124 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             resume=session.session_id  # Resume previous conversation if exists
         )
 
-        # Query Claude and stream response
-        async for message in query(prompt=prompt, options=options):
-            # Refresh typing indicator on each message
-            await send_typing_action(session, bot)
+        # Query Claude using ClaudeSDKClient (required for can_use_tool support)
+        # can_use_tool requires streaming mode - wrap prompt in async generator
+        # Format from SDK examples/streaming_mode.py
+        async def prompt_stream():
+            yield {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": prompt
+                },
+                "parent_tool_use_id": None,
+                "session_id": session.session_id or "default"
+            }
 
-            # Log SDK message
-            if session.logger:
-                session.logger.log_sdk_message(message)
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt_stream())
+            async for message in client.receive_response():
+                # Refresh typing indicator on each message
+                await send_typing_action(session, bot)
 
-            msg_type = type(message).__name__
+                # Log SDK message
+                if session.logger:
+                    session.logger.log_sdk_message(message)
 
-            # Handle different message types
-            if hasattr(message, 'content'):
-                content = message.content
-                if isinstance(content, list):
-                    for block in content:
-                        block_type = type(block).__name__
+                msg_type = type(message).__name__
 
-                        if hasattr(block, 'text'):
-                            # Text content - flush tools first, then accumulate text
-                            await flush_tool_buffer()
+                # Handle different message types
+                if hasattr(message, 'content'):
+                    content = message.content
+                    if isinstance(content, list):
+                        for block in content:
+                            block_type = type(block).__name__
 
-                            response_text += block.text
-                            response_msg = await send_or_edit_response(
-                                session, bot, response_msg, response_text
-                            )
+                            if hasattr(block, 'text'):
+                                # Text content - flush tools first, then accumulate text
+                                await flush_tool_buffer()
 
-                        elif hasattr(block, 'name') and hasattr(block, 'input'):
-                            # Tool use block - buffer it
-                            if response_text.strip():
+                                response_text += block.text
                                 response_msg = await send_or_edit_response(
                                     session, bot, response_msg, response_text
                                 )
-                                response_msg = None
-                                response_text = ""
 
-                            tool_name = block.name
-                            tool_input = block.input
+                            elif hasattr(block, 'name') and hasattr(block, 'input'):
+                                # Tool use block - buffer it
+                                if response_text.strip():
+                                    response_msg = await send_or_edit_response(
+                                        session, bot, response_msg, response_text
+                                    )
+                                    response_msg = None
+                                    response_text = ""
 
-                            # If different tool type, flush buffer first
-                            if tool_buffer_name and tool_buffer_name != tool_name:
-                                await flush_tool_buffer()
+                                tool_name = block.name
+                                tool_input = block.input
 
-                            # Add to buffer and update message immediately
-                            tool_buffer.append((tool_name, tool_input))
-                            tool_buffer_name = tool_name
-                            await update_tool_buffer_message()
+                                # If different tool type, flush buffer first
+                                if tool_buffer_name and tool_buffer_name != tool_name:
+                                    await flush_tool_buffer()
 
-                            # Buffer diff image for Edit tool
-                            if tool_name == "Edit" and "old_string" in tool_input and "new_string" in tool_input:
-                                file_path = tool_input.get("file_path", "file")
-                                img_buffer = edit_to_image(
-                                    file_path=file_path,
-                                    old_string=tool_input["old_string"],
-                                    new_string=tool_input["new_string"]
-                                )
-                                if img_buffer:
-                                    filename = file_path.split("/")[-1] if "/" in file_path else file_path
-                                    diff_images.append((img_buffer, filename))
+                                # Add to buffer and update message immediately
+                                tool_buffer.append((tool_name, tool_input))
+                                tool_buffer_name = tool_name
+                                await update_tool_buffer_message()
 
-                elif isinstance(content, str) and content:
-                    # Tool result - flush tool buffer first
-                    await flush_tool_buffer()
+                                # Buffer diff image for Edit tool
+                                if tool_name == "Edit" and "old_string" in tool_input and "new_string" in tool_input:
+                                    file_path = tool_input.get("file_path", "file")
+                                    img_buffer = edit_to_image(
+                                        file_path=file_path,
+                                        old_string=tool_input["old_string"],
+                                        new_string=tool_input["new_string"]
+                                    )
+                                    if img_buffer:
+                                        filename = file_path.split("/")[-1] if "/" in file_path else file_path
+                                        diff_images.append((img_buffer, filename))
 
-                    output = format_tool_output(content)
-                    if output:
-                        # Escape HTML entities in output
-                        safe_output = escape_html(output)
-                        await send_message(session, bot, f"<pre>{safe_output}</pre>", parse_mode="HTML")
+                    elif isinstance(content, str) and content:
+                        # Tool result - flush tool buffer first
+                        await flush_tool_buffer()
 
-                    # Refresh typing - more content likely coming after tool result
-                    await send_typing_action(session, bot)
+                        output = format_tool_output(content)
+                        if output:
+                            # Escape HTML entities in output
+                            safe_output = escape_html(output)
+                            await send_message(session, bot, f"<pre>{safe_output}</pre>", parse_mode="HTML")
 
-            # Capture session_id for multi-turn conversation
-            if hasattr(message, 'session_id') and message.session_id:
-                session.session_id = message.session_id
+                        # Refresh typing - more content likely coming after tool result
+                        await send_typing_action(session, bot)
 
-            # Log stats if available (but don't show to user - it's included in subscription)
-            if hasattr(message, 'cost_usd') or hasattr(message, 'total_cost_usd'):
-                cost = getattr(message, 'total_cost_usd', None) or getattr(message, 'cost_usd', None)
-                duration = getattr(message, 'duration_ms', 0)
-                if session.logger and cost is not None:
-                    session.logger.log_session_stats(cost, duration, {})
+                # Capture session_id for multi-turn conversation
+                if hasattr(message, 'session_id') and message.session_id:
+                    session.session_id = message.session_id
 
-        # Flush any remaining buffers
-        await flush_tool_buffer()
-        if response_text.strip() and response_msg is None:
-            await send_message(session, bot, response_text)
+                # Log stats if available (but don't show to user - it's included in subscription)
+                if hasattr(message, 'cost_usd') or hasattr(message, 'total_cost_usd'):
+                    cost = getattr(message, 'total_cost_usd', None) or getattr(message, 'cost_usd', None)
+                    duration = getattr(message, 'duration_ms', 0)
+                    if session.logger and cost is not None:
+                        session.logger.log_session_stats(cost, duration, {})
 
-        # Send diff images as media group (gallery)
-        if diff_images:
-            await send_diff_images_gallery(session, bot, diff_images)
+            # Flush any remaining buffers (inside async with, after loop)
+            await flush_tool_buffer()
+            if response_text.strip() and response_msg is None:
+                await send_message(session, bot, response_text)
 
+            # Send diff images as media group (gallery)
+            if diff_images:
+                await send_diff_images_gallery(session, bot, diff_images)
+
+    except ProcessError as e:
+        # Log stderr from CLI process
+        if session.logger:
+            session.logger.log_error("send_to_claude", e)
+            if e.stderr:
+                session.logger.log_stderr(e.stderr)
+        error_msg = f"❌ Error: {str(e)}"
+        if e.stderr:
+            error_msg += f"\nStderr: {e.stderr[:500]}"
+        await send_message(session, bot, error_msg)
     except Exception as e:
         error_msg = f"❌ Error: {str(e)}"
         await send_message(session, bot, error_msg)
@@ -461,8 +519,9 @@ async def send_or_edit_response(
                     )
                 else:
                     return await send_message(session, bot, text)
-            except Exception:
-                pass
+            except Exception as fallback_err:
+                if session.logger:
+                    session.logger.log_error("send_or_edit_response_fallback", fallback_err)
         return existing_msg
 
 
@@ -520,8 +579,10 @@ async def send_typing_action(session: ClaudeSession, bot: Bot) -> None:
             action=ChatAction.TYPING
         )
         session.last_typing_action = now
-    except Exception:
-        pass
+    except Exception as e:
+        # Only log if it's not a rate limit (those are expected)
+        if session.logger and "flood" not in str(e).lower():
+            session.logger.log_debug("send_typing_action", f"Failed: {e}")
 
 
 async def send_diff_images_gallery(

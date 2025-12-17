@@ -207,6 +207,66 @@ class SessionLogger:
         })
         self._write_log(f"ERROR [{context}] {type(error).__name__}: {error}")
 
+    def log_permission_request(self, request_id: str, tool_name: str, tool_input: dict) -> None:
+        """Log a permission request sent to user."""
+        self._write_jsonl({
+            "type": "permission_request",
+            "request_id": request_id,
+            "tool_name": tool_name,
+            "tool_input": {k: str(v)[:100] for k, v in tool_input.items()}
+        })
+        self._write_log(f"PERMISSION REQUEST id={request_id} tool={tool_name}")
+
+    def log_permission_callback(self, request_id: str, action: str, tool_name: str) -> None:
+        """Log a permission callback received from user."""
+        self._write_jsonl({
+            "type": "permission_callback",
+            "request_id": request_id,
+            "action": action,
+            "tool_name": tool_name
+        })
+        self._write_log(f"PERMISSION CALLBACK id={request_id} action={action} tool={tool_name}")
+
+    def log_permission_resolved(self, request_id: str, allowed: bool, found: bool) -> None:
+        """Log permission resolution result."""
+        self._write_jsonl({
+            "type": "permission_resolved",
+            "request_id": request_id,
+            "allowed": allowed,
+            "future_found": found
+        })
+        status = "ALLOWED" if allowed else "DENIED"
+        found_str = "found" if found else "NOT FOUND"
+        self._write_log(f"PERMISSION RESOLVED id={request_id} {status} (future {found_str})")
+
+    def log_permission_check(self, tool_name: str, in_allowlist: bool) -> None:
+        """Log permission check for a tool."""
+        self._write_jsonl({
+            "type": "permission_check",
+            "tool_name": tool_name,
+            "in_allowlist": in_allowlist
+        })
+        status = "ALLOWLISTED" if in_allowlist else "NEEDS APPROVAL"
+        self._write_log(f"PERMISSION CHECK tool={tool_name} {status}")
+
+    def log_stderr(self, message: str) -> None:
+        """Log stderr output from Claude CLI."""
+        self._write_jsonl({
+            "type": "stderr",
+            "message": message
+        })
+        self._write_log(f"STDERR {message}")
+
+    def log_debug(self, context: str, message: str, **kwargs) -> None:
+        """Log debug information."""
+        self._write_jsonl({
+            "type": "debug",
+            "context": context,
+            "message": message,
+            **kwargs
+        })
+        self._write_log(f"DEBUG [{context}] {message}")
+
     def close(self) -> None:
         """Close log files."""
         try:
