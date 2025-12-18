@@ -17,9 +17,22 @@ A Telegram bot that connects forum topics to Claude Code CLI sessions.
 
 ## Setup
 
-1. Create a Telegram bot via [@BotFather](https://t.me/botfather)
-2. Enable "Topics" in your Telegram group (group settings → Topics)
-3. Add the bot to your group as admin
+### 1. Create a Telegram Bot
+
+1. Open [@BotFather](https://t.me/botfather) in Telegram
+2. Send `/newbot` and follow the prompts to name your bot
+3. Copy the API token (looks like `123456789:ABCdefGHI...`)
+
+### 2. Create a Forum Group
+
+1. Create a new Telegram group (or use existing)
+2. Go to group settings → Topics → Enable
+3. Add your bot to the group
+4. Promote bot to admin with these permissions:
+   - Delete messages
+   - Manage topics
+
+### 3. Install and Run
 
 ```bash
 # Clone and install
@@ -50,4 +63,11 @@ Or use `/new` command to manually start a session.
 
 - Python 3.10+
 - Telegram Bot API token
-- Claude Code CLI installed and authenticated
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and logged in
+
+## Configuration
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `BOT_TOKEN` | Yes | - | Telegram bot token from BotFather |
+| `PROJECTS_DIR` | No | `~/Projects` | Root directory for project folders. When starting a session, you pick a subfolder from here as the working directory for Claude. |
