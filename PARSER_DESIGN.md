@@ -259,9 +259,9 @@ The delta-based approach handles this by:
 
 ## Files to Modify
 
-- `/Users/gavrix/Projects/tele-bot/parser.py` - Add color-based classification
-- `/Users/gavrix/Projects/tele-bot/session.py` - Handle SegmentUpdate actions
-- `/Users/gavrix/Projects/tele-bot/test_parser.py` - Add color-based tests
+- `/Users/gavrix/Projects/tele-claude/parser.py` - Add color-based classification
+- `/Users/gavrix/Projects/tele-claude/session.py` - Handle SegmentUpdate actions
+- `/Users/gavrix/Projects/tele-claude/test_parser.py` - Add color-based tests
 
 ## Segment Types
 

@@ -27,7 +27,7 @@ from logger import SessionLogger
 from diff_image import edit_to_image
 
 # Module logger (named _log to avoid collision with SessionLogger variables named 'logger')
-_log = logging.getLogger("tele-bot.session")
+_log = logging.getLogger("tele-claude.session")
 
 
 # Context window sizes by model (tokens)

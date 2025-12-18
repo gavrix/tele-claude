@@ -1,4 +1,4 @@
-# tele-bot
+# tele-claude
 
 A Telegram bot that connects forum topics to Claude Code CLI sessions.
 
@@ -36,8 +36,8 @@ A Telegram bot that connects forum topics to Claude Code CLI sessions.
 
 ```bash
 # Clone and install
-git clone https://github.com/gavrix/tele-bot.git
-cd tele-bot
+git clone https://github.com/gavrix/tele-claude.git
+cd tele-claude
 pip install -r requirements.txt
 
 # Configure

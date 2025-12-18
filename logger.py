@@ -58,7 +58,7 @@ def setup_logging() -> None:
     root_logger.addHandler(file_handler)
 
     # App logger for our own code
-    _app_logger = logging.getLogger("tele-bot")
+    _app_logger = logging.getLogger("tele-claude")
     _app_logger.setLevel(logging.DEBUG)
 
     # Log startup

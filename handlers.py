@@ -14,7 +14,7 @@ from telegram.ext import ContextTypes
 import logging
 
 # Use standard logging - logger.py's setup_logging() will configure the handlers
-logger = logging.getLogger("tele-bot.handlers")
+logger = logging.getLogger("tele-claude.handlers")
 
 from config import GENERAL_TOPIC_ID
 from utils import get_project_folders
