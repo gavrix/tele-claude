@@ -452,16 +452,25 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
         tool_buffer_msg = None
 
     try:
-        # Check if AGENTS.md exists for project context
+        # Check if AGENTS.md exists and pre-load its content into system prompt
         agents_md_path = Path(session.cwd) / "AGENTS.md"
         system_prompt: Optional[SystemPromptPreset] = None
         if agents_md_path.exists():
-            system_prompt = SystemPromptPreset(
-                type="preset",
-                preset="claude_code",
-                append="IMPORTANT: This project has an AGENTS.md file in the root directory. "
-                       "Read it at the start of the session to understand project context and instructions."
-            )
+            try:
+                agents_content = agents_md_path.read_text()
+                system_prompt = SystemPromptPreset(
+                    type="preset",
+                    preset="claude_code",
+                    append=f"# Project Context (from AGENTS.md)\n\n{agents_content}"
+                )
+            except Exception:
+                # If we can't read the file, fall back to instruction-based approach
+                system_prompt = SystemPromptPreset(
+                    type="preset",
+                    preset="claude_code",
+                    append="IMPORTANT: This project has an AGENTS.md file in the root directory. "
+                           "Read it at the start of the session to understand project context and instructions."
+                )
 
         # Configure options - use permission handler for interactive tool approval
         options = ClaudeAgentOptions(
