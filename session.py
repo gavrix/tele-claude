@@ -25,6 +25,7 @@ from claude_agent_sdk.types import SystemPromptPreset
 from config import PROJECTS_DIR
 from logger import SessionLogger
 from diff_image import edit_to_image
+from commands import load_contextual_commands, register_commands_for_chat
 
 # Module logger (named _log to avoid collision with SessionLogger variables named 'logger')
 _log = logging.getLogger("tele-claude.session")
@@ -120,6 +121,7 @@ class ClaudeSession:
     client: Optional[ClaudeSDKClient] = None  # Active SDK client for interrupt support
     last_context_percent: Optional[float] = None  # Last known context remaining %
     pending_image_path: Optional[str] = None  # Buffered image waiting for prompt
+    contextual_commands: list = field(default_factory=list)  # Project-specific slash commands
 
 
 async def interrupt_session(thread_id: int) -> bool:
@@ -348,14 +350,21 @@ async def start_session(chat_id: int, thread_id: int, folder_name: str, bot: Bot
     # Create logger
     logger = SessionLogger(thread_id, chat_id, str(cwd))
 
+    # Load contextual commands from project's commands/ directory
+    contextual_commands = load_contextual_commands(str(cwd))
+
     # Store session with bot reference
     sessions[thread_id] = ClaudeSession(
         chat_id=chat_id,
         thread_id=thread_id,
         cwd=str(cwd),
         bot=bot,
-        logger=logger
+        logger=logger,
+        contextual_commands=contextual_commands,
     )
+
+    # Register commands with Telegram for autocompletion
+    await register_commands_for_chat(bot, chat_id, contextual_commands)
 
     # Send welcome message
     await bot.send_message(

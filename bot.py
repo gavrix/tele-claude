@@ -33,9 +33,9 @@ def main() -> None:
     # Handle inline keyboard button clicks
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Handle all text messages in groups
+    # Handle all text messages in groups (including slash commands for sessions)
     app.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.SUPERGROUP & ~filters.COMMAND,
+        filters.TEXT & filters.ChatType.SUPERGROUP,
         handle_message
     ))
 

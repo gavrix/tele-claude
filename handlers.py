@@ -19,6 +19,7 @@ logger = logging.getLogger("tele-claude.handlers")
 from config import GENERAL_TOPIC_ID
 from utils import get_project_folders
 from session import sessions, start_session, send_to_claude, resolve_permission, interrupt_session
+from commands import get_command_prompt
 
 
 async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -260,13 +261,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if thread_id and thread_id in sessions:
         session = sessions[thread_id]
 
+        # Check for slash commands
+        prompt = text
+        if text.startswith("/"):
+            # Extract command name (handle /cmd or /cmd@botname)
+            command_part = text.split()[0]
+            command_name = command_part.lstrip("/").split("@")[0]
+
+            # Look up the command
+            cmd_prompt = get_command_prompt(command_name, session.contextual_commands)
+            if cmd_prompt is not None:
+                # Use command's prompt (silently, no echo)
+                prompt = cmd_prompt
+                logger.debug(f"Executing slash command /{command_name}")
+            else:
+                # Unknown command - pass through to Claude as-is
+                logger.debug(f"Unknown command /{command_name}, passing to Claude")
+
         # Check for pending image
         pending_image = session.pending_image_path
         if pending_image:
             session.pending_image_path = None  # Clear it
-            prompt = f"{pending_image}\n\n{text}"
-        else:
-            prompt = text
+            prompt = f"{pending_image}\n\n{prompt}"
 
         # Interrupt any ongoing query first
         was_interrupted = await interrupt_session(thread_id)
