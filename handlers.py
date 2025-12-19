@@ -19,7 +19,7 @@ logger = logging.getLogger("tele-claude.handlers")
 from config import GENERAL_TOPIC_ID
 from utils import get_project_folders
 from session import sessions, start_session, send_to_claude, resolve_permission, interrupt_session
-from commands import get_command_prompt
+from commands import get_command_prompt, get_help_message
 
 
 async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -208,6 +208,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
     # Unknown callback - ignore
+
+
+async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /help command - show all available commands."""
+    message = update.message
+    if message is None:
+        return
+
+    thread_id = message.message_thread_id
+    chat_id = message.chat_id
+
+    # Get contextual commands if in an active session
+    contextual_commands: list = []
+    if thread_id and thread_id in sessions:
+        contextual_commands = sessions[thread_id].contextual_commands
+
+    help_text = get_help_message(contextual_commands)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        text=help_text,
+        parse_mode="HTML"
+    )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
