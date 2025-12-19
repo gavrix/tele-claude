@@ -16,16 +16,36 @@ import logging
 # Use standard logging - logger.py's setup_logging() will configure the handlers
 logger = logging.getLogger("tele-claude.handlers")
 
-from config import GENERAL_TOPIC_ID
+from config import GENERAL_TOPIC_ID, ALLOWED_CHATS
 from utils import get_project_folders
 from session import sessions, start_session, send_to_claude, resolve_permission, interrupt_session
 from commands import get_command_prompt, get_help_message
+
+
+def is_authorized_chat(chat_id: int | None) -> bool:
+    """Check if a chat is authorized to use the bot.
+
+    Returns True if:
+    - ALLOWED_CHATS is empty (no restrictions configured)
+    - chat_id is in the ALLOWED_CHATS set
+    """
+    if not ALLOWED_CHATS:
+        # No restrictions configured - allow all (backwards compatible)
+        return True
+    if chat_id is None:
+        return False
+    return chat_id in ALLOWED_CHATS
 
 
 async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /new command to create a topic and show folder picker."""
     message = update.message
     if message is None:
+        return
+
+    # Authorization check
+    if not is_authorized_chat(message.chat_id):
+        logger.warning(f"Unauthorized /new attempt from chat {message.chat_id}")
         return
 
     # Only allow in General topic
@@ -83,6 +103,11 @@ async def handle_topic_created(update: Update, context: ContextTypes.DEFAULT_TYP
     if message is None or message.forum_topic_created is None:
         return
 
+    # Authorization check
+    if not is_authorized_chat(message.chat_id):
+        logger.warning(f"Unauthorized topic creation from chat {message.chat_id}")
+        return
+
     thread_id = message.message_thread_id
     chat_id = message.chat_id
 
@@ -117,6 +142,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Handle inline keyboard button clicks."""
     query = update.callback_query
     if query is None:
+        return
+
+    # Authorization check
+    callback_message = query.message
+    chat_id = callback_message.chat.id if callback_message else None
+    if not is_authorized_chat(chat_id):
+        logger.warning(f"Unauthorized callback from chat {chat_id}")
+        await query.answer("Unauthorized", show_alert=True)
         return
 
     await query.answer()  # Dismiss the loading state
@@ -216,6 +249,11 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if message is None:
         return
 
+    # Authorization check
+    if not is_authorized_chat(message.chat_id):
+        logger.warning(f"Unauthorized /help attempt from chat {message.chat_id}")
+        return
+
     thread_id = message.message_thread_id
     chat_id = message.chat_id
 
@@ -237,6 +275,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Handle photo messages - save to temp dir and send to Claude."""
     message = update.message
     if message is None or not message.photo:
+        return
+
+    # Authorization check
+    if not is_authorized_chat(message.chat_id):
+        logger.warning(f"Unauthorized photo from chat {message.chat_id}")
         return
 
     thread_id = message.message_thread_id
@@ -273,6 +316,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Handle text messages and forward to Claude session if active."""
     message = update.message
     if message is None:
+        return
+
+    # Authorization check
+    if not is_authorized_chat(message.chat_id):
+        logger.warning(f"Unauthorized message from chat {message.chat_id}")
         return
 
     thread_id = message.message_thread_id
