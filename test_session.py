@@ -109,12 +109,12 @@ class TestCalculateContextRemaining:
         # Just below threshold
         usage = {"input_tokens": 171000}
         result = calculate_context_remaining(usage)
-        assert result < CONTEXT_WARNING_THRESHOLD
+        assert result is not None and result < CONTEXT_WARNING_THRESHOLD
 
         # Just above threshold
         usage = {"input_tokens": 169000}
         result = calculate_context_remaining(usage)
-        assert result > CONTEXT_WARNING_THRESHOLD
+        assert result is not None and result > CONTEXT_WARNING_THRESHOLD
 
 
 class TestSendOrEditResponse:

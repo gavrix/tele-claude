@@ -20,7 +20,10 @@ from telegram import Bot, Message, InputMediaPhoto, InlineKeyboardButton, Inline
 from telegram.constants import ChatAction
 
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ProcessError, PermissionResultAllow, PermissionResultDeny, HookMatcher, HookContext
-from claude_agent_sdk.types import SystemPromptPreset
+from claude_agent_sdk.types import (
+    SystemPromptPreset, ToolPermissionContext, HookInput, HookJSONOutput,
+    UserMessage, AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+)
 
 from config import PROJECTS_DIR
 from logger import SessionLogger
@@ -226,8 +229,8 @@ def create_permission_handler(session: ClaudeSession):
     """Create a can_use_tool callback for the given session."""
     async def handle_permission(
         tool_name: str,
-        tool_input: dict,
-        context: dict
+        tool_input: dict[str, Any],
+        context: ToolPermissionContext
     ) -> Union[PermissionResultAllow, PermissionResultDeny]:
         try:
             in_allowlist = is_tool_allowed(tool_name)
@@ -264,15 +267,16 @@ def create_permission_handler(session: ClaudeSession):
 def create_pre_compact_hook(session: ClaudeSession):
     """Create a PreCompact hook to log and notify user when context is being compacted."""
     async def handle_pre_compact(
-        input_data: dict[str, Any],
+        input_data: HookInput,
         tool_use_id: Optional[str],
         context: HookContext
-    ) -> dict[str, Any]:
+    ) -> HookJSONOutput:
         """Called before the SDK compacts conversation history."""
         try:
             # Log the compaction event with full input data for analysis
             if session.logger:
-                session.logger.log_compact_event(input_data)
+                # Cast to dict for logging since HookInput is a TypedDict
+                session.logger.log_compact_event(dict(input_data))  # type: ignore[arg-type]
 
             # Notify user in chat
             if session.bot:
@@ -286,8 +290,8 @@ def create_pre_compact_hook(session: ClaudeSession):
             if session.logger:
                 session.logger.log_error("pre_compact_hook", e)
 
-        # Return empty dict to allow compaction to proceed
-        return {}
+        # Return async hook output to allow compaction to proceed
+        return {"async_": True}
 
     return handle_pre_compact
 
@@ -302,7 +306,7 @@ MIN_SEND_INTERVAL = 1.0
 TYPING_ACTION_INTERVAL = 4.0
 
 
-def calculate_context_remaining(usage: dict, model: str = "default") -> Optional[float]:
+def calculate_context_remaining(usage: Optional[dict[str, Any]], model: str = "default") -> Optional[float]:
     """Calculate percentage of context window remaining from usage data.
 
     Returns percentage remaining (0-100), or None if usage data insufficient.
@@ -533,16 +537,12 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                 if session.logger:
                     session.logger.log_sdk_message(message)
 
-                msg_type = type(message).__name__
-
-                # Handle different message types
-                if hasattr(message, 'content'):
+                # Handle different message types based on their class
+                if isinstance(message, (UserMessage, AssistantMessage)):
                     content = message.content
                     if isinstance(content, list):
                         for block in content:
-                            block_type = type(block).__name__
-
-                            if hasattr(block, 'text'):
+                            if isinstance(block, TextBlock):
                                 # Text content - flush tools first, then accumulate text
                                 await flush_tool_buffer()
 
@@ -551,7 +551,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                                     session, bot, response_msg, response_text, response_msg_text_len
                                 )
 
-                            elif hasattr(block, 'name') and hasattr(block, 'input'):
+                            elif isinstance(block, ToolUseBlock):
                                 # Tool use block - buffer it
                                 if response_text.strip():
                                     response_msg, response_msg_text_len = await send_or_edit_response(
@@ -598,21 +598,19 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
                         # Refresh typing - more content likely coming after tool result
                         await send_typing_action(session, bot)
 
-                # Capture session_id for multi-turn conversation
-                if hasattr(message, 'session_id') and message.session_id:
-                    session.session_id = message.session_id
-
                 # Capture model from AssistantMessage
-                if msg_type == "AssistantMessage" and hasattr(message, 'model'):
+                if isinstance(message, AssistantMessage):
                     current_model = message.model
 
-                # Capture usage from ResultMessage
-                if msg_type == "ResultMessage":
-                    if hasattr(message, 'usage') and message.usage:
+                # Capture session_id and usage from ResultMessage
+                if isinstance(message, ResultMessage):
+                    if message.session_id:
+                        session.session_id = message.session_id
+                    if message.usage:
                         last_usage = message.usage
                     # Log stats (but don't show cost to user - it's included in subscription)
-                    cost = getattr(message, 'total_cost_usd', None)
-                    duration = getattr(message, 'duration_ms', 0)
+                    cost = message.total_cost_usd
+                    duration = message.duration_ms
                     if session.logger and cost is not None:
                         session.logger.log_session_stats(cost, duration, last_usage or {})
 

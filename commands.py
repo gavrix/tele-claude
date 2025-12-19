@@ -107,19 +107,21 @@ async def register_commands_for_chat(
 ) -> None:
     """Register commands with Telegram for autocompletion.
 
-    Combines hard-coded and contextual commands, registers with
-    BotCommandScopeChat for this specific chat.
+    Only registers hard-coded universal commands, not contextual ones.
+    Telegram's BotCommandScope doesn't support per-topic commands in forums,
+    so contextual commands would leak across sessions and overwrite each other.
+    Contextual commands still work when typed manually, just without autocompletion.
 
     Args:
         bot: Telegram bot instance
         chat_id: Chat ID to register commands for
-        contextual_commands: Project-specific commands to include
+        contextual_commands: Project-specific commands (unused, kept for API compat)
     """
-    all_commands = HARDCODED_COMMANDS + contextual_commands
-
+    # Only register hardcoded commands - contextual commands would leak across
+    # forum topics since Telegram doesn't support per-topic command scopes
     telegram_commands = [
         BotCommand(command=cmd.name, description=cmd.description)
-        for cmd in all_commands
+        for cmd in HARDCODED_COMMANDS
     ]
 
     try:
