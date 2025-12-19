@@ -4,7 +4,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 
 from config import BOT_TOKEN
-from handlers import handle_new_topic, handle_callback, handle_message, handle_topic_created, handle_photo
+from handlers import handle_new_topic, handle_callback, handle_message, handle_topic_created, handle_photo, handle_help
 from logger import setup_logging
 
 # Configure logging - silent console, full file logging
@@ -27,6 +27,13 @@ def main() -> None:
     app.add_handler(CommandHandler(
         "new",
         handle_new_topic,
+        filters=filters.ChatType.SUPERGROUP
+    ))
+
+    # Handle /help command - show all available commands
+    app.add_handler(CommandHandler(
+        "help",
+        handle_help,
         filters=filters.ChatType.SUPERGROUP
     ))
 

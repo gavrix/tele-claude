@@ -8,6 +8,7 @@ from commands import (
     HARDCODED_COMMANDS,
     load_contextual_commands,
     get_command_prompt,
+    get_help_message,
 )
 
 
@@ -185,7 +186,45 @@ class TestHardcodedCommands:
         names = {cmd.name for cmd in HARDCODED_COMMANDS}
         assert "compact" in names
 
+    def test_help_command_exists(self):
+        """Help command should exist in hard-coded commands."""
+        names = {cmd.name for cmd in HARDCODED_COMMANDS}
+        assert "help" in names
+
     def test_all_hardcoded_are_not_contextual(self):
         """All hard-coded commands should have is_contextual=False."""
         for cmd in HARDCODED_COMMANDS:
             assert cmd.is_contextual is False
+
+
+class TestGetHelpMessage:
+    """Tests for get_help_message()."""
+
+    def test_shows_global_commands(self):
+        """Help message should include global commands."""
+        result = get_help_message([])
+        assert "/help" in result
+        assert "/plan" in result
+        assert "/compact" in result
+        assert "<b>Global:</b>" in result
+
+    def test_shows_contextual_commands(self):
+        """Help message should include contextual commands when provided."""
+        contextual = [
+            SlashCommand("test", "Run tests", "pytest", True),
+            SlashCommand("lint", "Run linter", "ruff check", True),
+        ]
+        result = get_help_message(contextual)
+        assert "/test" in result
+        assert "/lint" in result
+        assert "<b>Project:</b>" in result
+
+    def test_no_project_section_when_empty(self):
+        """Help message should not show Project section when no contextual commands."""
+        result = get_help_message([])
+        assert "<b>Project:</b>" not in result
+
+    def test_returns_html_format(self):
+        """Help message should use HTML formatting."""
+        result = get_help_message([])
+        assert "<b>Available Commands</b>" in result

@@ -28,6 +28,12 @@ class SlashCommand:
 # Hard-coded universal commands - available in all sessions
 HARDCODED_COMMANDS: list[SlashCommand] = [
     SlashCommand(
+        name="help",
+        description="Show all available commands",
+        prompt="",  # Handled specially - doesn't go to Claude
+        is_contextual=False,
+    ),
+    SlashCommand(
         name="plan",
         description="Enter plan mode - explore and design before implementing",
         prompt="/plan",
@@ -158,3 +164,28 @@ def get_command_prompt(
             return cmd.prompt
 
     return None
+
+
+def get_help_message(contextual_commands: list[SlashCommand]) -> str:
+    """Generate help message listing all available commands.
+
+    Args:
+        contextual_commands: Project-specific commands for current session
+
+    Returns:
+        Formatted help message string (HTML)
+    """
+    lines = ["<b>Available Commands</b>\n"]
+
+    # Global commands section
+    lines.append("<b>Global:</b>")
+    for cmd in HARDCODED_COMMANDS:
+        lines.append(f"  /{cmd.name} - {cmd.description}")
+
+    # Contextual commands section (if any)
+    if contextual_commands:
+        lines.append("\n<b>Project:</b>")
+        for cmd in contextual_commands:
+            lines.append(f"  /{cmd.name} - {cmd.description}")
+
+    return "\n".join(lines)
