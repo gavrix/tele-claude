@@ -691,8 +691,8 @@ async def send_or_edit_response(
 ) -> tuple[Optional[Message], int]:
     """Send a new response message or edit an existing one.
 
-    Handles overflow by starting a new message when text exceeds 4000 chars.
-    Includes robust fallback logic for HTML parsing errors.
+    Handles overflow by starting new messages when text exceeds 4000 chars.
+    Splits long responses into multiple messages to avoid truncation.
 
     Args:
         session: The Claude session
@@ -702,24 +702,33 @@ async def send_or_edit_response(
         msg_text_len: Length of text already in existing_msg (for overflow detection)
 
     Returns:
-        Tuple of (current message, length of text in that message)
+        Tuple of (last message sent, length of text in that message)
     """
     if not text.strip():
         return existing_msg, msg_text_len
 
-    # Truncate if too long (safety net)
+    # Check if we need to overflow to new messages
+    if len(text) > 4000 and existing_msg and msg_text_len > 0:
+        # Current message is full, send overflow text as new message(s)
+        overflow_text = text[msg_text_len:]
+
+        # Split overflow into chunks and send each as a new message
+        chunks = split_text(overflow_text, 4000)
+        last_msg: Optional[Message] = None
+        last_len = 0
+
+        for chunk in chunks:
+            new_msg = await _send_with_fallback(session, bot, chunk, existing_msg=None)
+            if new_msg:
+                last_msg = new_msg
+                last_len = len(chunk)
+
+        return last_msg if last_msg else existing_msg, last_len if last_msg else msg_text_len
+
+    # Text fits in one message - edit existing or send new
     display_text = text
     if len(display_text) > 4000:
         display_text = display_text[:3990] + "\n..."
-
-    # Check if we need to overflow to a new message
-    if len(text) > 4000 and existing_msg and msg_text_len > 0:
-        # Current message is full, start a new one with overflow text
-        overflow_text = text[msg_text_len:]
-        if len(overflow_text) > 4000:
-            overflow_text = overflow_text[:3990] + "\n..."
-        new_msg = await _send_with_fallback(session, bot, overflow_text, existing_msg=None)
-        return new_msg, len(overflow_text) if new_msg else msg_text_len
 
     result_msg = await _send_with_fallback(session, bot, display_text, existing_msg=existing_msg)
     if result_msg:

@@ -219,6 +219,32 @@ class TestSendOrEditResponse:
         assert result_len <= 4000
 
     @pytest.mark.asyncio
+    async def test_overflow_splits_into_multiple_messages(self, mock_session, mock_bot, mock_message):
+        """Very long overflow text should be split into multiple messages."""
+        # First 3000 chars already in message, adding 10000 more = 13000 total
+        existing_text = "a" * 3000
+        overflow_text = "b" * 10000  # Should split into 3 messages
+        full_text = existing_text + overflow_text
+
+        msg1 = MagicMock(spec=Message)
+        msg1.message_id = 101
+        msg2 = MagicMock(spec=Message)
+        msg2.message_id = 102
+        msg3 = MagicMock(spec=Message)
+        msg3.message_id = 103
+        mock_bot.send_message.side_effect = [msg1, msg2, msg3]
+        mock_session.thread_id = 1
+
+        result_msg, result_len = await send_or_edit_response(
+            mock_session, mock_bot, mock_message, full_text, 3000
+        )
+
+        # Should have sent 3 messages (10000 chars / 4000 = 3 chunks)
+        assert mock_bot.send_message.call_count == 3
+        # Result should be the last message sent
+        assert result_msg == msg3
+
+    @pytest.mark.asyncio
     async def test_edit_failure_falls_back_to_plain_text(self, mock_session, mock_bot, mock_message):
         """HTML parse error should fallback to plain text."""
         text = "Hello **world**"
