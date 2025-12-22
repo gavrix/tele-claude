@@ -500,6 +500,7 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Bot) -> None:
             cwd=session.cwd,
             resume=session.session_id,  # Resume previous conversation if exists
             system_prompt=system_prompt,
+            setting_sources=["user", "project"],  # Load skills from ~/.claude/skills/ and .claude/skills/
             mcp_servers={
                 "telegram-tools": telegram_mcp,
             },
