@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from session import ClaudeSession
 
 # Configuration (imported from config.py at runtime to avoid circular imports)
-ACCESSIBILITY_MAX_LENGTH = 50000  # Truncate if larger
+ACCESSIBILITY_MAX_LENGTH = 15000  # Truncate if larger (keep small to avoid SDK buffer overflow)
 
 # Global instances (reused across sessions)
 _playwright: Optional[Playwright] = None
@@ -306,7 +306,8 @@ def create_browser_mcp_server(session: "ClaudeSession"):
 
     @tool(
         "browser_navigate",
-        "Navigate browser to a URL. Returns accessibility tree and screenshot path for visual inspection.",
+        "Navigate browser to a URL. Returns screenshot path for visual inspection. "
+        "Use browser_snapshot to get the accessibility tree if needed.",
         {
             "url": str,
         }
@@ -332,13 +333,23 @@ def create_browser_mcp_server(session: "ClaudeSession"):
             # Brief wait for dynamic content
             await asyncio.sleep(1)
 
-            state = await get_page_state(browser, session)
+            # Only take screenshot, no accessibility tree
+            screenshot_path = await take_screenshot(browser, session)
+
+            if browser.is_cdp and browser.cdp_page:
+                current_url = browser.cdp_page.url
+                title = await browser.cdp_page.title()
+            elif browser.pw_page:
+                current_url = browser.pw_page.url
+                title = await browser.pw_page.title()
+            else:
+                current_url = url
+                title = "unknown"
 
             result_text = (
-                f"Navigated to: {state['current_url']}\n"
-                f"Title: {state['page_title']}\n"
-                f"Screenshot: {state['screenshot_path']}\n\n"
-                f"Accessibility Tree:\n{state['accessibility_tree']}"
+                f"Navigated to: {current_url}\n"
+                f"Title: {title}\n"
+                f"Screenshot: {screenshot_path}"
             )
 
             return {"content": [{"type": "text", "text": result_text}]}
@@ -378,30 +389,66 @@ def create_browser_mcp_server(session: "ClaudeSession"):
 
     @tool(
         "browser_click",
-        "Click an element identified by its accessibility role and name. "
-        "Use role and name from the accessibility tree (e.g., role='button', name='Submit'). "
-        "Use index if there are multiple matches (0-indexed).",
+        "Click an element. Supports two modes:\n"
+        "1. By backend_node_id (preferred): Use ID from browser_find results for precise clicking.\n"
+        "2. By role/name: Use accessibility role and name from browser_snapshot.\n"
+        "When backend_node_id is provided, role/name are ignored.",
         {
-            "role": str,
-            "name": str,
-            "index": int,  # Optional, defaults to 0
+            "backend_node_id": int,  # Optional: click by backend node ID (from browser_find)
+            "role": str,  # Optional: accessibility role
+            "name": str,  # Optional: accessibility name
+            "index": int,  # Optional, defaults to 0 (for role/name mode)
         }
     )
     async def browser_click(args: dict[str, Any]) -> dict[str, Any]:
-        """Click an element by role and name."""
+        """Click an element by backend node ID or role/name."""
+        backend_node_id = args.get("backend_node_id")
         role = args.get("role", "")
         name = args.get("name", "")
         index = args.get("index", 0)
 
-        if not role:
+        if not backend_node_id and not role:
             return {
-                "content": [{"type": "text", "text": "Error: role is required"}],
+                "content": [{"type": "text", "text": "Error: either backend_node_id or role is required"}],
                 "is_error": True
             }
 
         try:
             browser = await ensure_browser(session)
 
+            # Mode 1: Click by backend node ID (from browser_find)
+            if backend_node_id is not None:
+                if browser.is_cdp and browser.cdp_page:
+                    try:
+                        await browser.cdp_page.click_by_node_id(backend_node_id, timeout=10.0)
+                    except CDPElementNotFoundError as e:
+                        screenshot_path = await take_screenshot(browser, session)
+                        return {
+                            "content": [{
+                                "type": "text",
+                                "text": f"Node with backend_node_id={backend_node_id} not found. "
+                                        f"The DOM may have changed. Re-run browser_find to get fresh IDs.\n\n"
+                                        f"Screenshot: {screenshot_path}"
+                            }],
+                            "is_error": True
+                        }
+                else:
+                    return {
+                        "content": [{"type": "text", "text": "Error: backend_node_id requires CDP mode"}],
+                        "is_error": True
+                    }
+
+                # Brief wait for any dynamic updates after click
+                await asyncio.sleep(0.5)
+                screenshot_path = await take_screenshot(browser, session)
+
+                result_text = (
+                    f"Clicked element with backend_node_id={backend_node_id}\n"
+                    f"Screenshot: {screenshot_path}"
+                )
+                return {"content": [{"type": "text", "text": result_text}]}
+
+            # Mode 2: Click by role/name (existing behavior)
             if browser.is_cdp and browser.cdp_page:
                 # Use cdp-browser click
                 try:
@@ -583,7 +630,8 @@ def create_browser_mcp_server(session: "ClaudeSession"):
     @tool(
         "browser_scroll",
         "Scroll the page. Direction can be 'up', 'down', 'top', or 'bottom'. "
-        "Optionally specify pixels to scroll (default 500).",
+        "Optionally specify pixels to scroll (default 500). Returns screenshot only. "
+        "Use browser_snapshot if you need the accessibility tree.",
         {
             "direction": str,
             "pixels": int,  # Optional, defaults to 500
@@ -623,7 +671,8 @@ def create_browser_mcp_server(session: "ClaudeSession"):
                 # Wait for any lazy-loaded content
                 await asyncio.sleep(0.3)
 
-                state = await get_page_state(browser, session)
+                # Only take screenshot, no accessibility tree
+                screenshot_path = await take_screenshot(browser, session)
 
                 # Get scroll position (use direct object literal, not arrow function for CDP)
                 scroll_pos = await cdp_page.evaluate(
@@ -644,7 +693,8 @@ def create_browser_mcp_server(session: "ClaudeSession"):
                 # Wait for any lazy-loaded content
                 await asyncio.sleep(0.3)
 
-                state = await get_page_state(browser, session)
+                # Only take screenshot, no accessibility tree
+                screenshot_path = await take_screenshot(browser, session)
 
                 # Get scroll position
                 scroll_pos = await pw_page.evaluate(
@@ -659,8 +709,7 @@ def create_browser_mcp_server(session: "ClaudeSession"):
             result_text = (
                 f"Scrolled {direction}" + (f" {pixels}px" if direction in ["up", "down"] else "") + "\n"
                 f"Scroll position: y={scroll_pos['y']} / {scroll_pos['height']}\n"
-                f"Screenshot: {state['screenshot_path']}\n\n"
-                f"Accessibility Tree:\n{state['accessibility_tree']}"
+                f"Screenshot: {screenshot_path}"
             )
 
             return {"content": [{"type": "text", "text": result_text}]}
@@ -668,6 +717,90 @@ def create_browser_mcp_server(session: "ClaudeSession"):
         except Exception as e:
             return {
                 "content": [{"type": "text", "text": f"Scroll error: {str(e)}"}],
+                "is_error": True
+            }
+
+    @tool(
+        "browser_find",
+        "Find elements by visible text content. Returns matches with backend node IDs for clicking, "
+        "bounding boxes for visual correlation with screenshots, and clickable ancestor detection.\n"
+        "Use this to bridge from what you see in screenshots to clickable elements.\n"
+        "Then use browser_click(backend_node_id=...) to click the element.",
+        {
+            "text": str,  # Text to search for
+            "exact": bool,  # Optional: if true, exact match; if false (default), case-insensitive contains
+            "max_matches": int,  # Optional: maximum matches to return (default 10)
+        }
+    )
+    async def browser_find(args: dict[str, Any]) -> dict[str, Any]:
+        """Find elements by text content."""
+        text = args.get("text", "")
+        exact = args.get("exact", False)
+        max_matches = args.get("max_matches", 10)
+
+        if not text:
+            return {
+                "content": [{"type": "text", "text": "Error: text is required"}],
+                "is_error": True
+            }
+
+        try:
+            browser = await ensure_browser(session)
+
+            if not (browser.is_cdp and browser.cdp_page):
+                return {
+                    "content": [{"type": "text", "text": "Error: browser_find requires CDP mode"}],
+                    "is_error": True
+                }
+
+            result = await browser.cdp_page.find_by_text(
+                text=text,
+                exact=exact,
+                max_matches=max_matches,
+                timeout=15.0
+            )
+
+            # Format output
+            lines = [
+                f"Search: \"{text}\" ({result.get('search_mode', 'contains')})",
+                f"Found: {result.get('totalFound', 0)} matches, returning {result.get('returned', 0)}",
+                f"Viewport: {result.get('viewport', {}).get('width', '?')}x{result.get('viewport', {}).get('height', '?')}",
+                ""
+            ]
+
+            for match in result.get("matches", []):
+                idx = match.get("index", "?")
+                matched_text = match.get("matched_text", "")
+                bounds = match.get("bounds", {})
+                element = match.get("element", {})
+                clickable = match.get("clickable_ancestor")
+                snippet = match.get("snippet", "")
+
+                lines.append(f"--- Match {idx} ---")
+                lines.append(f"Matched: \"{matched_text}\"")
+                lines.append(f"Bounds: x={bounds.get('x', '?')}, y={bounds.get('y', '?')}, "
+                           f"w={bounds.get('width', '?')}, h={bounds.get('height', '?')}")
+                lines.append(f"Element: <{element.get('tag', '?')}> backend_node_id={element.get('backend_node_id', 'N/A')}")
+
+                if clickable:
+                    lines.append(f"Clickable ancestor: <{clickable.get('tag', '?')}> "
+                               f"backend_node_id={clickable.get('backend_node_id', 'N/A')} "
+                               f"role={clickable.get('role', 'N/A')}")
+                else:
+                    lines.append("Clickable ancestor: None (try clicking element directly)")
+
+                if snippet:
+                    lines.append(f"Snippet:\n{snippet}")
+                lines.append("")
+
+            if not result.get("matches"):
+                lines.append("No matches found. Try a different search term or check the screenshot.")
+
+            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+        except Exception as e:
+            return {
+                "content": [{"type": "text", "text": f"Find error: {str(e)}"}],
                 "is_error": True
             }
 
@@ -700,6 +833,7 @@ def create_browser_mcp_server(session: "ClaudeSession"):
             browser_click,
             browser_type,
             browser_scroll,
+            browser_find,
             browser_close,
         ]
     )

@@ -1,7 +1,7 @@
 import asyncio
 import base64
 import contextlib
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .cdp import CDPSession
 from .errors import ElementNotFoundError, EvaluationError, NavigationError, TimeoutError
@@ -126,7 +126,7 @@ class Page:
 
     async def screenshot(self, path: Optional[str] = None, full_page: bool = False, timeout: Optional[float] = None) -> Optional[bytes]:
         await self._ensure_open()
-        params: Dict[str, Any] = {"format": "png", "captureBeyondViewport": True}
+        params: Dict[str, Any] = {"format": "png", "captureBeyondViewport": full_page}
         if full_page:
             metrics = await self._session.send("Page.getLayoutMetrics", session_id=self._session_id, timeout=timeout or self._default_timeout)
             content_size = metrics.get("contentSize", {})
@@ -189,6 +189,510 @@ class Page:
             await self._session.send(
                 "Input.dispatchKeyEvent",
                 {"type": event_type, "key": key, "text": key if len(key) == 1 else ""},
+                session_id=self._session_id,
+                timeout=timeout or self._default_timeout,
+            )
+
+    async def find_by_text(
+        self,
+        text: str,
+        exact: bool = False,
+        max_matches: int = 10,
+        ancestors: int = 3,
+        descendants: int = 2,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Find elements by text content, return with backend node IDs and bounds.
+
+        Args:
+            text: Text to search for
+            exact: If True, exact match. If False, case-insensitive contains
+            max_matches: Maximum number of matches to return
+            ancestors: How many ancestor levels to include in snippet
+            descendants: How many descendant levels to include in snippet
+            timeout: Operation timeout
+
+        Returns:
+            Dict with matches, each containing backend_node_id, bounds, snippet, clickable_ancestor
+        """
+        await self._ensure_open()
+
+        # Escape text for JS string
+        escaped_text = text.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+
+        # JavaScript to find elements by text using TreeWalker
+        find_js = f"""
+        (() => {{
+            const searchText = '{escaped_text}';
+            const exact = {str(exact).lower()};
+            const maxMatches = {max_matches};
+
+            const CLICKABLE_SELECTOR = [
+                'button',
+                'a[href]',
+                'input[type="button"]',
+                'input[type="submit"]',
+                '[role="button"]',
+                '[role="link"]',
+                '[role="menuitem"]',
+                '[role="tab"]',
+                '[role="option"]',
+                '[role="checkbox"]',
+                '[role="radio"]',
+                '[role="switch"]',
+                '[tabindex]:not([tabindex="-1"])'
+            ].join(',');
+
+            function isVisible(el) {{
+                if (!el || !el.getBoundingClientRect) return false;
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return false;
+                const style = getComputedStyle(el);
+                if (style.visibility === 'hidden' || style.display === 'none') return false;
+                return true;
+            }}
+
+            function isClickable(el) {{
+                if (!el || !el.matches) return false;
+                try {{
+                    if (el.matches(CLICKABLE_SELECTOR)) {{
+                        const style = getComputedStyle(el);
+                        return style.pointerEvents !== 'none'
+                            && style.visibility !== 'hidden'
+                            && !el.disabled;
+                    }}
+                }} catch (e) {{}}
+                return false;
+            }}
+
+            function findClickableAncestor(el) {{
+                let current = el;
+                while (current && current !== document.body) {{
+                    if (isClickable(current)) {{
+                        return current;
+                    }}
+                    current = current.parentElement;
+                }}
+                return null;
+            }}
+
+            function getElementInfo(el) {{
+                const rect = el.getBoundingClientRect();
+                return {{
+                    tag: el.tagName.toLowerCase(),
+                    id: el.id || null,
+                    className: el.className ? (typeof el.className === 'string' ? el.className.split(' ')[0] : null) : null,
+                    role: el.getAttribute('role'),
+                    textContent: (el.textContent || '').trim().substring(0, 100)
+                }};
+            }}
+
+            // Use TreeWalker for efficient text node search
+            const matches = [];
+            const seenElements = new Set();
+
+            const walker = document.createTreeWalker(
+                document.body,
+                NodeFilter.SHOW_TEXT,
+                {{
+                    acceptNode: (node) => {{
+                        const nodeText = node.textContent || '';
+                        if (!nodeText.trim()) return NodeFilter.FILTER_REJECT;
+
+                        const matches = exact
+                            ? nodeText.trim() === searchText
+                            : nodeText.toLowerCase().includes(searchText.toLowerCase());
+
+                        return matches ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+                    }}
+                }}
+            );
+
+            while (walker.nextNode() && matches.length < maxMatches) {{
+                const textNode = walker.currentNode;
+                const parentEl = textNode.parentElement;
+
+                if (!parentEl || seenElements.has(parentEl)) continue;
+                if (!isVisible(parentEl)) continue;
+
+                seenElements.add(parentEl);
+
+                // Find matched substring
+                const nodeText = textNode.textContent || '';
+                let matchedText = searchText;
+                if (!exact) {{
+                    const lowerText = nodeText.toLowerCase();
+                    const idx = lowerText.indexOf(searchText.toLowerCase());
+                    if (idx >= 0) {{
+                        matchedText = nodeText.substring(idx, idx + searchText.length);
+                    }}
+                }}
+
+                const rect = parentEl.getBoundingClientRect();
+                const clickableAncestor = findClickableAncestor(parentEl);
+
+                matches.push({{
+                    matchedText,
+                    element: getElementInfo(parentEl),
+                    bounds: {{
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height)
+                    }},
+                    clickableAncestor: clickableAncestor ? getElementInfo(clickableAncestor) : null,
+                    // Store references for later backend ID resolution
+                    _elementRef: parentEl,
+                    _clickableRef: clickableAncestor
+                }});
+            }}
+
+            return {{
+                matches,
+                totalFound: matches.length,
+                viewport: {{
+                    width: window.innerWidth,
+                    height: window.innerHeight
+                }},
+                devicePixelRatio: window.devicePixelRatio || 1
+            }};
+        }})()
+        """
+
+        # Execute the search
+        result = await self._session.send(
+            "Runtime.evaluate",
+            {
+                "expression": find_js,
+                "returnByValue": False,  # Need object references
+                "awaitPromise": False,
+            },
+            session_id=self._session_id,
+            timeout=timeout or self._default_timeout,
+        )
+
+        if result.get("exceptionDetails"):
+            raise EvaluationError(f"Find failed: {result['exceptionDetails'].get('text', 'unknown error')}")
+
+        # Get the result object ID
+        result_object_id = result.get("result", {}).get("objectId")
+        if not result_object_id:
+            # Fallback: result was returned by value
+            return {"matches": [], "totalFound": 0, "search_text": text, "search_mode": "exact" if exact else "contains"}
+
+        # Get properties from the result
+        props_result = await self._session.send(
+            "Runtime.getProperties",
+            {"objectId": result_object_id, "ownProperties": True},
+            session_id=self._session_id,
+            timeout=timeout or self._default_timeout,
+        )
+
+        # Parse the result
+        result_data: Dict[str, Any] = {"matches": [], "totalFound": 0}
+        for prop in props_result.get("result", []):
+            name = prop.get("name")
+            value = prop.get("value", {})
+            if name == "totalFound":
+                result_data["totalFound"] = value.get("value", 0)
+            elif name == "viewport":
+                vp_id = value.get("objectId")
+                if vp_id:
+                    vp_props = await self._session.send(
+                        "Runtime.getProperties",
+                        {"objectId": vp_id, "ownProperties": True},
+                        session_id=self._session_id,
+                        timeout=timeout or self._default_timeout,
+                    )
+                    result_data["viewport"] = {
+                        p["name"]: p["value"]["value"]
+                        for p in vp_props.get("result", [])
+                        if p.get("value", {}).get("value") is not None
+                    }
+            elif name == "devicePixelRatio":
+                result_data["devicePixelRatio"] = value.get("value", 1)
+            elif name == "matches":
+                matches_id = value.get("objectId")
+                if matches_id:
+                    result_data["matches"] = await self._process_find_matches(
+                        matches_id, ancestors, descendants, timeout
+                    )
+
+        result_data["search_text"] = text
+        result_data["search_mode"] = "exact" if exact else "contains"
+        result_data["returned"] = len(result_data["matches"])
+
+        return result_data
+
+    async def _process_find_matches(
+        self,
+        matches_object_id: str,
+        ancestors: int,
+        descendants: int,
+        timeout: Optional[float],
+    ) -> List[Dict[str, Any]]:
+        """Process match array and resolve backend node IDs."""
+        matches_props = await self._session.send(
+            "Runtime.getProperties",
+            {"objectId": matches_object_id, "ownProperties": True},
+            session_id=self._session_id,
+            timeout=timeout or self._default_timeout,
+        )
+
+        processed_matches = []
+
+        for prop in matches_props.get("result", []):
+            if not prop.get("name", "").isdigit():
+                continue
+
+            match_id = prop.get("value", {}).get("objectId")
+            if not match_id:
+                continue
+
+            match_data = await self._extract_match_data(match_id, ancestors, descendants, timeout)
+            if match_data:
+                match_data["index"] = int(prop["name"])
+                processed_matches.append(match_data)
+
+        # Sort by index
+        processed_matches.sort(key=lambda m: m["index"])
+        return processed_matches
+
+    async def _extract_match_data(
+        self,
+        match_object_id: str,
+        ancestors: int,
+        descendants: int,
+        timeout: Optional[float],
+    ) -> Optional[Dict[str, Any]]:
+        """Extract data from a single match object."""
+        props = await self._session.send(
+            "Runtime.getProperties",
+            {"objectId": match_object_id, "ownProperties": True},
+            session_id=self._session_id,
+            timeout=timeout or self._default_timeout,
+        )
+
+        match_data: Dict[str, Any] = {}
+        element_ref_id = None
+        clickable_ref_id = None
+
+        for prop in props.get("result", []):
+            name = prop.get("name")
+            value = prop.get("value", {})
+
+            if name == "matchedText":
+                match_data["matched_text"] = value.get("value", "")
+            elif name == "bounds":
+                bounds_id = value.get("objectId")
+                if bounds_id:
+                    bounds_props = await self._session.send(
+                        "Runtime.getProperties",
+                        {"objectId": bounds_id, "ownProperties": True},
+                        session_id=self._session_id,
+                        timeout=timeout or self._default_timeout,
+                    )
+                    match_data["bounds"] = {
+                        p["name"]: p["value"]["value"]
+                        for p in bounds_props.get("result", [])
+                        if p.get("value", {}).get("value") is not None
+                    }
+            elif name == "element":
+                el_id = value.get("objectId")
+                if el_id:
+                    match_data["element"] = await self._extract_element_info(el_id, timeout)
+            elif name == "clickableAncestor":
+                if value.get("type") != "null" and value.get("objectId"):
+                    ca_id = value.get("objectId")
+                    match_data["clickable_ancestor"] = await self._extract_element_info(ca_id, timeout)
+                else:
+                    match_data["clickable_ancestor"] = None
+            elif name == "_elementRef":
+                element_ref_id = value.get("objectId")
+            elif name == "_clickableRef":
+                if value.get("type") != "null":
+                    clickable_ref_id = value.get("objectId")
+
+        # Resolve backend node IDs
+        if element_ref_id:
+            try:
+                node_desc = await self._session.send(
+                    "DOM.describeNode",
+                    {"objectId": element_ref_id},
+                    session_id=self._session_id,
+                    timeout=timeout or self._default_timeout,
+                )
+                backend_id = node_desc.get("node", {}).get("backendNodeId")
+                if backend_id and "element" in match_data:
+                    match_data["element"]["backend_node_id"] = backend_id
+            except Exception:
+                pass
+
+        if clickable_ref_id:
+            try:
+                node_desc = await self._session.send(
+                    "DOM.describeNode",
+                    {"objectId": clickable_ref_id},
+                    session_id=self._session_id,
+                    timeout=timeout or self._default_timeout,
+                )
+                backend_id = node_desc.get("node", {}).get("backendNodeId")
+                clickable_ancestor = match_data.get("clickable_ancestor")
+                if backend_id and clickable_ancestor is not None:
+                    clickable_ancestor["backend_node_id"] = backend_id
+            except Exception:
+                pass
+
+        # Build snippet
+        if element_ref_id:
+            match_data["snippet"] = await self._build_snippet(
+                element_ref_id, ancestors, descendants, timeout
+            )
+
+        return match_data if match_data else None
+
+    async def _extract_element_info(
+        self,
+        object_id: str,
+        timeout: Optional[float],
+    ) -> Dict[str, Any]:
+        """Extract element info from object ID."""
+        props = await self._session.send(
+            "Runtime.getProperties",
+            {"objectId": object_id, "ownProperties": True},
+            session_id=self._session_id,
+            timeout=timeout or self._default_timeout,
+        )
+
+        info = {}
+        for prop in props.get("result", []):
+            name = prop.get("name")
+            value = prop.get("value", {}).get("value")
+            if name in ("tag", "id", "className", "role", "textContent") and value is not None:
+                info[name] = value
+        return info
+
+    async def _build_snippet(
+        self,
+        element_object_id: str,
+        ancestors: int,
+        descendants: int,
+        timeout: Optional[float],
+    ) -> str:
+        """Build a compact snippet showing element context."""
+        snippet_js = f"""
+        (function(el) {{
+            const ancestors = {ancestors};
+            const descendants = {descendants};
+            const lines = [];
+
+            function getNodeLine(node, depth, isMatch) {{
+                if (!node || !node.tagName) return null;
+                const tag = node.tagName.toLowerCase();
+                const id = node.id ? '#' + node.id : '';
+                const cls = node.className && typeof node.className === 'string'
+                    ? '.' + node.className.split(' ')[0]
+                    : '';
+                const role = node.getAttribute && node.getAttribute('role')
+                    ? '[role=' + node.getAttribute('role') + ']'
+                    : '';
+                const indent = '  '.repeat(depth);
+                let line = indent + '- ' + tag + id + cls + role;
+                if (isMatch) line += ' <-- match';
+                return line;
+            }}
+
+            function walkDescendants(node, depth, maxDepth) {{
+                if (depth > maxDepth || !node) return;
+                for (const child of (node.children || [])) {{
+                    const line = getNodeLine(child, depth, false);
+                    if (line) lines.push(line);
+                    walkDescendants(child, depth + 1, maxDepth);
+                }}
+            }}
+
+            // Collect ancestors
+            const ancestorChain = [];
+            let current = el;
+            for (let i = 0; i < ancestors && current && current !== document.body; i++) {{
+                if (current.parentElement) {{
+                    ancestorChain.unshift(current.parentElement);
+                    current = current.parentElement;
+                }} else {{
+                    break;
+                }}
+            }}
+
+            // Build snippet
+            let depth = 0;
+            for (const ancestor of ancestorChain) {{
+                const line = getNodeLine(ancestor, depth, false);
+                if (line) lines.push(line);
+                depth++;
+            }}
+
+            // The matched element
+            const matchLine = getNodeLine(el, depth, true);
+            if (matchLine) lines.push(matchLine);
+
+            // Descendants
+            walkDescendants(el, depth + 1, depth + descendants);
+
+            return lines.join('\\n').substring(0, 400);
+        }})(this)
+        """
+
+        try:
+            result = await self._session.send(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": element_object_id,
+                    "functionDeclaration": snippet_js,
+                    "returnByValue": True,
+                },
+                session_id=self._session_id,
+                timeout=timeout or self._default_timeout,
+            )
+            return result.get("result", {}).get("value", "(snippet unavailable)")
+        except Exception:
+            return "(snippet unavailable)"
+
+    async def click_by_node_id(
+        self,
+        backend_node_id: int,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """Click element by backend node ID.
+
+        Args:
+            backend_node_id: The backend DOM node ID to click
+            timeout: Operation timeout
+        """
+        await self._ensure_open()
+
+        # Verify node still exists
+        try:
+            await self._session.send(
+                "DOM.describeNode",
+                {"backendNodeId": backend_node_id},
+                session_id=self._session_id,
+                timeout=timeout or self._default_timeout,
+            )
+        except Exception as e:
+            raise ElementNotFoundError(
+                "node",
+                str(backend_node_id),
+                f"Node with backend_node_id={backend_node_id} no longer exists. Re-run browser_find to get fresh IDs."
+            ) from e
+
+        # Scroll into view and click
+        await self._scroll_into_view(backend_node_id, timeout)
+        x, y = await self._element_center(backend_node_id, timeout)
+
+        for event_type in ("mousePressed", "mouseReleased"):
+            await self._session.send(
+                "Input.dispatchMouseEvent",
+                {"type": event_type, "x": x, "y": y, "button": "left", "clickCount": 1},
                 session_id=self._session_id,
                 timeout=timeout or self._default_timeout,
             )
@@ -296,7 +800,7 @@ class Page:
         obj = result.get("object", {})
         return obj["objectId"]
 
-    def _format_ax_tree(self, nodes: list[dict], max_lines: int = 60) -> str:
+    def _format_ax_tree(self, nodes: list[dict], max_lines: int = 300) -> str:
         if not nodes:
             return "(empty accessibility tree)"
         node_map = {n["nodeId"]: n for n in nodes if "nodeId" in n}
