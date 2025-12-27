@@ -365,17 +365,43 @@ async def start_session(chat_id: int, thread_id: int, folder_name: str, bot: Bot
     if not cwd.exists():
         return False
 
-    # Create logger
-    logger = SessionLogger(thread_id, chat_id, str(cwd))
+    return await _start_session_impl(chat_id, thread_id, str(cwd), folder_name, bot)
+
+
+async def start_session_local(chat_id: int, thread_id: int, cwd: str, bot: Bot) -> bool:
+    """Start a Claude session with an absolute path (for local project bot).
+
+    Logs are stored in <cwd>/.bot-logs/ instead of global logs dir.
+    """
+    cwd_path = Path(cwd)
+    if not cwd_path.exists():
+        return False
+
+    # Use project-local logs directory
+    logs_dir = cwd_path / ".bot-logs"
+    return await _start_session_impl(chat_id, thread_id, cwd, cwd_path.name, bot, logs_dir)
+
+
+async def _start_session_impl(
+    chat_id: int,
+    thread_id: int,
+    cwd: str,
+    display_name: str,
+    bot: Bot,
+    logs_dir: Optional[Path] = None
+) -> bool:
+    """Internal: start session with given cwd path."""
+    # Create logger (use custom logs_dir if provided)
+    logger = SessionLogger(thread_id, chat_id, cwd, logs_dir)
 
     # Load contextual commands from project's commands/ directory
-    contextual_commands = load_contextual_commands(str(cwd))
+    contextual_commands = load_contextual_commands(cwd)
 
     # Store session with bot reference
     sessions[thread_id] = ClaudeSession(
         chat_id=chat_id,
         thread_id=thread_id,
-        cwd=str(cwd),
+        cwd=cwd,
         bot=bot,
         logger=logger,
         contextual_commands=contextual_commands,
@@ -388,7 +414,7 @@ async def start_session(chat_id: int, thread_id: int, folder_name: str, bot: Bot
     await bot.send_message(
         chat_id=chat_id,
         message_thread_id=thread_id,
-        text=f"Claude session started in <code>{folder_name}</code>",
+        text=f"Claude session started in <code>{display_name}</code>",
         parse_mode="HTML"
     )
 

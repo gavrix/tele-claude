@@ -14,6 +14,7 @@ A Telegram bot that connects forum topics to Claude Code CLI sessions.
 - Interactive tool permission prompts (approve/deny)
 - Context window warning when below 15%
 - Send a new message to interrupt Claude mid-response
+- Browser automation via CDP or Playwright
 
 ## Setup
 
@@ -52,12 +53,53 @@ python bot.py
 
 ## Usage
 
+### Multi-project mode (default)
+
 1. Create a new topic in your Telegram forum group
 2. Bot auto-detects and shows a folder picker
 3. Select a project folder to bind to this topic
 4. Chat with Claude in that topic
 
 Or use `/new` command to manually start a session.
+
+### Local project mode
+
+Run a bot instance anchored to a specific project directory:
+
+```bash
+cd /path/to/your/project
+
+# Create config file
+cat > .env.telebot << EOF
+BOT_TOKEN=your_bot_token_here
+ALLOWED_CHATS=-100xxxxx  # optional
+EOF
+
+# Run
+python /path/to/tele-claude/bot_local.py
+```
+
+Every new topic auto-starts a session in that directory. Useful for running separate bot instances per project.
+
+## Browser Automation
+
+Claude can control a browser to navigate websites, click elements, fill forms, and take screenshots.
+
+### Option 1: Use existing Chrome (recommended)
+
+Connect to your running Chrome with all your cookies and logged-in sessions:
+
+```bash
+# Start Chrome with remote debugging
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+
+# Add to .env
+echo "BROWSER_CDP_ENDPOINT=http://localhost:9222" >> .env
+```
+
+### Option 2: Standalone Chromium
+
+If no CDP endpoint is configured, the bot launches its own Chromium instance with persistent storage per session.
 
 ## Requirements
 
@@ -70,4 +112,8 @@ Or use `/new` command to manually start a session.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `BOT_TOKEN` | Yes | - | Telegram bot token from BotFather |
-| `PROJECTS_DIR` | No | `~/Projects` | Root directory for project folders. When starting a session, you pick a subfolder from here as the working directory for Claude. |
+| `PROJECTS_DIR` | No | `~/Projects` | Root directory for project folders |
+| `ALLOWED_CHATS` | No | - | Comma-separated chat IDs to allow (empty = allow all) |
+| `BROWSER_CDP_ENDPOINT` | No | - | Chrome DevTools Protocol endpoint (e.g., `http://localhost:9222`) |
+| `BROWSER_HEADLESS` | No | `true` | Run standalone Chromium in headless mode |
+| `BROWSER_DATA_DIR` | No | `~/.tele-bot/browsers` | Persistent storage for standalone browser sessions |

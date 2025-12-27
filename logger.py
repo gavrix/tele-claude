@@ -106,10 +106,11 @@ class SessionLogger:
     - session.jsonl: Machine-readable JSON lines
     """
 
-    def __init__(self, thread_id: int, chat_id: int, cwd: str):
+    def __init__(self, thread_id: int, chat_id: int, cwd: str, logs_dir: Optional[Path] = None):
         self.thread_id = thread_id
         self.chat_id = chat_id
         self.cwd = cwd
+        self.logs_dir = logs_dir or LOGS_DIR
 
         # Create session directory
         self.session_dir = self._create_session_dir()
@@ -125,10 +126,10 @@ class SessionLogger:
 
     def _create_session_dir(self) -> Path:
         """Create session directory with timestamp."""
-        LOGS_DIR.mkdir(exist_ok=True)
+        self.logs_dir.mkdir(exist_ok=True)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        session_dir = LOGS_DIR / f"session_{self.thread_id}_{ts}"
+        session_dir = self.logs_dir / f"session_{self.thread_id}_{ts}"
         session_dir.mkdir(exist_ok=True)
 
         return session_dir
