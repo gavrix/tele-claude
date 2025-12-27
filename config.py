@@ -15,3 +15,9 @@ _allowed_chats_str = os.getenv("ALLOWED_CHATS", "")
 ALLOWED_CHATS: set[int] = {
     int(cid.strip()) for cid in _allowed_chats_str.split(",") if cid.strip()
 }
+
+# Browser automation settings
+BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "true").lower() == "true"
+BROWSER_DATA_DIR = Path(os.getenv("BROWSER_DATA_DIR", Path.home() / ".tele-bot" / "browsers"))
+# CDP endpoint for connecting to existing Chrome (e.g., "http://localhost:9222")
+BROWSER_CDP_ENDPOINT = os.getenv("BROWSER_CDP_ENDPOINT", "")
