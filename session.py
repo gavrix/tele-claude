@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Any, Union
+from typing import Optional, Any, Union, Callable, Awaitable
 
 import mistune
 from telegram import Bot, Message, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
@@ -34,7 +34,7 @@ from diff_image import edit_to_image
 from commands import load_contextual_commands, register_commands_for_chat
 from mcp_tools import create_telegram_mcp_server
 from core.session_store import session_store
-from core.types import make_session_key
+from core.types import make_session_key, Trigger
 
 # Platform abstraction imports
 from platforms import (
@@ -266,6 +266,9 @@ class ClaudeSession:
     contextual_commands: list = field(default_factory=list)  # Project-specific slash commands
     sandboxed: bool = False  # If True, only load project settings (no ~/.claude/)
     model_override: Optional[str] = None  # Per-session model choice (overrides CLAUDE_MODEL)
+    watchdog_enabled: bool = False  # Auto-retry on token limit
+    _watchdog_task: Optional[asyncio.Task] = None  # Scheduled retry task
+    actor_enqueue: Optional[Callable[[Trigger], Awaitable[None]]] = None  # Actor queue hook
 
     def get_platform(self) -> Optional[PlatformClient]:
         """Get platform client, creating from bot if needed (backwards compat)."""
@@ -870,6 +873,95 @@ async def _get_available_models(session: ClaudeSession) -> list[dict]:
     return models
 
 
+def _parse_limit_reset(text: str) -> Optional[float]:
+    """Parse reset time from 'resets 3pm (UTC)' pattern.
+
+    Returns delay in seconds until reset, or None if pattern not found.
+    """
+    from datetime import datetime, timezone
+
+    match = re.search(r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(UTC\)", text, re.IGNORECASE)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2)) if match.group(2) else 0
+    ampm = match.group(3).lower()
+
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+
+    now = datetime.now(timezone.utc)
+    reset_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    # If reset time is in the past, it must be tomorrow
+    if reset_time <= now:
+        from datetime import timedelta
+        reset_time += timedelta(days=1)
+
+    delay = (reset_time - now).total_seconds()
+    return delay
+
+
+async def _watchdog_retry(session: ClaudeSession, thread_id: int, delay: float) -> None:
+    """Wait for delay, then send 'Continue' to Claude."""
+    watchdog_task = asyncio.current_task()
+    try:
+        await asyncio.sleep(delay)
+        if not session.watchdog_enabled:
+            return  # watchdog was turned off while waiting
+        if session.current_task and not session.current_task.done():
+            return  # user already sent something, skip
+
+        enqueue = session.actor_enqueue
+        if enqueue is None:
+            _log.warning("Watchdog retry skipped: actor enqueue unavailable for thread_id=%s", thread_id)
+            return
+
+        await enqueue(
+            Trigger(
+                platform=_session_platform_type(session),
+                session_key=_session_key_for_session(session),
+                prompt="Continue",
+                reply_context={"cwd": session.cwd},
+                source="watchdog",
+            )
+        )
+        await send_message(session, message=TextMessage("🐕 Watchdog: sending Continue"))
+    except asyncio.CancelledError:
+        pass  # watchdog turned off or session closed
+    finally:
+        if session._watchdog_task is watchdog_task:
+            session._watchdog_task = None
+
+
+async def handle_watchdog_command(thread_id: int, args: str) -> None:
+    """Handle /watchdog command — toggle auto-retry on token limit."""
+    session = sessions.get(thread_id)
+    if not session:
+        return
+
+    args = args.strip().lower()
+
+    if args == "on":
+        session.watchdog_enabled = True
+        await send_message(session, message=TextMessage("🐕 Watchdog: **ON**"))
+    elif args == "off":
+        session.watchdog_enabled = False
+        if session._watchdog_task and not session._watchdog_task.done():
+            session._watchdog_task.cancel()
+            session._watchdog_task = None
+        await send_message(session, message=TextMessage("🐕 Watchdog: **OFF**"))
+    else:
+        state = "ON" if session.watchdog_enabled else "OFF"
+        pending = ""
+        if session._watchdog_task and not session._watchdog_task.done():
+            pending = " (retry pending)"
+        await send_message(session, message=TextMessage(f"🐕 Watchdog: **{state}**{pending}"))
+
+
 async def handle_model_command(thread_id: int, args: str) -> None:
     """Handle /model command — list available models or switch model."""
     session = sessions.get(thread_id)
@@ -1072,8 +1164,12 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
             message = str(error).lower()
             return "resume" in message or "session" in message
 
+        # Watchdog: track limit-hit detection
+        limit_hit = False
+        limit_reset_delay: Optional[float] = None
+
         async def run_stream(options: ClaudeAgentOptions) -> None:
-            nonlocal response_text, response_ref, response_msg_text_len, tool_buffer_name, last_usage, current_model
+            nonlocal response_text, response_ref, response_msg_text_len, tool_buffer_name, last_usage, current_model, limit_hit, limit_reset_delay
             async with ClaudeSDKClient(options=options) as client:
                 # Store client reference for interrupt support
                 session.client = client
@@ -1277,6 +1373,10 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                         if message.is_error:
                             error_text = message.result or "Session ended with an error"
                             await send_message(session, message=TextMessage(f"⚠️ {error_text}"))
+                            # Watchdog: detect limit-hit pattern
+                            if error_text and "hit your limit" in error_text.lower():
+                                limit_hit = True
+                                limit_reset_delay = _parse_limit_reset(error_text)
     
                         cost = message.total_cost_usd
                         duration = message.duration_ms
@@ -1354,6 +1454,16 @@ async def send_to_claude(thread_id: int, prompt: str, bot: Optional[Bot] = None)
                 await run_stream(build_options(None))
             else:
                 raise
+
+        # Watchdog: schedule retry if limit was hit
+        if limit_hit and session.watchdog_enabled:
+            delay = limit_reset_delay if limit_reset_delay else 3600.0
+            delay += 60  # buffer after reset
+            minutes = int(delay // 60)
+            await send_message(session, message=TextMessage(f"🐕 Watchdog: limit hit, retry in {minutes} min"))
+            if session._watchdog_task and not session._watchdog_task.done():
+                session._watchdog_task.cancel()
+            session._watchdog_task = asyncio.create_task(_watchdog_retry(session, thread_id, delay))
 
         _log_session_debug(
             session,

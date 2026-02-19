@@ -51,6 +51,12 @@ HARDCODED_COMMANDS: list[SlashCommand] = [
         prompt="",  # Handled specially - doesn't go to Claude
         is_contextual=False,
     ),
+    SlashCommand(
+        name="watchdog",
+        description="Toggle auto-retry on token limit",
+        prompt="",  # Handled specially - doesn't go to Claude
+        is_contextual=False,
+    ),
 ]
 
 

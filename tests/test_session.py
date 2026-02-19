@@ -371,3 +371,35 @@ class TestModelContextWindows:
     def test_default_context_window(self):
         """Default context window should be 200k."""
         assert MODEL_CONTEXT_WINDOWS["default"] == 200000
+
+
+class TestWatchdogRetry:
+    """Tests for watchdog retry path."""
+
+    @pytest.mark.asyncio
+    async def test_watchdog_retry_enqueues_continue_via_actor(self, monkeypatch):
+        """Watchdog retry should enqueue through SessionActor, not start task directly."""
+        import session as session_module
+
+        sent_messages = AsyncMock()
+        start_task = MagicMock()
+        enqueued = []
+
+        async def fake_enqueue(trigger):
+            enqueued.append(trigger)
+
+        monkeypatch.setattr(session_module, "send_message", sent_messages)
+        monkeypatch.setattr(session_module, "start_claude_task", start_task)
+
+        session = ClaudeSession(chat_id=123, thread_id=456, cwd="/tmp")
+        session.watchdog_enabled = True
+        session.actor_enqueue = fake_enqueue
+
+        await session_module._watchdog_retry(session, thread_id=456, delay=0)
+
+        assert len(enqueued) == 1
+        assert enqueued[0].prompt == "Continue"
+        assert enqueued[0].source == "watchdog"
+        assert enqueued[0].session_key == "telegram:123:456"
+        sent_messages.assert_called_once()
+        start_task.assert_not_called()

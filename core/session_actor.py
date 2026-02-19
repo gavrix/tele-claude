@@ -24,6 +24,7 @@ class SessionActor:
     _mailbox: asyncio.Queue[Trigger] = field(default_factory=asyncio.Queue)
     _run_loop_task: Optional[asyncio.Task] = None
     _generation_id: int = 0
+    _queued_non_watchdog: int = 0
 
     active: bool = True
     current_task: Optional[asyncio.Task] = None
@@ -32,11 +33,15 @@ class SessionActor:
 
     async def start(self) -> None:
         """Start the actor's run loop."""
+        if hasattr(self.claude_session, "actor_enqueue"):
+            self.claude_session.actor_enqueue = self.enqueue
         if self._run_loop_task is None or self._run_loop_task.done():
             self._run_loop_task = asyncio.create_task(self._run_loop())
 
     async def enqueue(self, trigger: Trigger) -> None:
         """Add trigger to mailbox."""
+        if trigger.source != "watchdog":
+            self._queued_non_watchdog += 1
         await self._mailbox.put(trigger)
 
     async def _run_loop(self) -> None:
@@ -47,7 +52,18 @@ class SessionActor:
             except asyncio.CancelledError:
                 break
 
+            if trigger.source != "watchdog" and self._queued_non_watchdog > 0:
+                self._queued_non_watchdog -= 1
+
             try:
+                self._cancel_watchdog_retry()
+                if trigger.source == "watchdog":
+                    if self.current_task and not self.current_task.done():
+                        _log.debug("Skipping watchdog trigger while task is active session_key=%s", self.session_key)
+                        continue
+                    if self._queued_non_watchdog > 0:
+                        _log.debug("Skipping watchdog trigger due queued user input session_key=%s", self.session_key)
+                        continue
                 if self.current_task and not self.current_task.done():
                     self._generation_id += 1
                     self.stats.interrupt_count += 1
@@ -95,6 +111,16 @@ class SessionActor:
                     await session_module.handle_model_command(thread_id, args)
                 return
 
+            # /watchdog is handled directly — not sent to Claude
+            if command_name == "watchdog":
+                import session as session_module
+
+                thread_id = getattr(self.claude_session, "thread_id", None)
+                if thread_id is not None:
+                    args = prompt[len(prompt.split()[0]):].strip()
+                    await session_module.handle_watchdog_command(thread_id, args)
+                return
+
             from commands import get_command_prompt
 
             contextual = getattr(self.claude_session, "contextual_commands", [])
@@ -125,6 +151,8 @@ class SessionActor:
 
     async def _cancel_current_task(self) -> None:
         """Cancel current task and wait for cleanup."""
+        self._cancel_watchdog_retry()
+
         if self.current_task:
             interrupted = False
             try:
@@ -147,6 +175,14 @@ class SessionActor:
         if self.pending_permission and not self.pending_permission.done():
             self.pending_permission.cancel()
         self.pending_permission = None
+
+    def _cancel_watchdog_retry(self) -> None:
+        """Cancel a pending watchdog retry for this session, if any."""
+        watchdog_task = getattr(self.claude_session, "_watchdog_task", None)
+        if watchdog_task and not watchdog_task.done():
+            watchdog_task.cancel()
+        if hasattr(self.claude_session, "_watchdog_task"):
+            self.claude_session._watchdog_task = None
 
     async def resolve_permission(self, allowed: bool, always: bool) -> None:
         """Resolve a pending permission request."""
